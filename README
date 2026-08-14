@@ -2,6 +2,21 @@ Patch for the English version of Warhammer Dark Omen.
 
 Adds a Mod menu to the main menu to make selecting of mods easier.
 
+## HD Movie Playback
+
+This fork adds the ability to replace any in-game movie with a modern
+video file, played through a bundled copy of ffplay (from FFmpeg).
+
+Setup:
+- Place `ffplay.exe` in the `PRG_ENG` folder alongside `darkpatch.dll`
+- Create an `HDMovies` folder next to `MOVIES` and `PRG_ENG` (i.e. one
+  level up from PRG_ENG, in the main Dark Omen folder)
+- Drop in a replacement named after the original movie, e.g.
+  `HDMovies\eng.mp4` for the startup movie
+
+Movies without a matching HD replacement play exactly as they always
+have, through the original unmodified game code.
+
 See discussion thread at http://forum.dark-omen.org/tools/mod-selector-t1118.0.html
 
 Code licensed under the WTFPL.

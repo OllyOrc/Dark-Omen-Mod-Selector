@@ -56,6 +56,7 @@ void applyHooks()
 	display::Load();
 	ctl::Load();
 	multiplayer_scene::Load();
+	movie_hook::Load();
 
 	//VirtualProtect((void*)0x00401000, 0x000BC000, oldProt, &oldProt);
 }
