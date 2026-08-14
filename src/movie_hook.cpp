@@ -8,77 +8,54 @@
  * play exactly as they always have, through the untouched original
  * code - this is purely additive.
  *
- * PROVEN: this logic (patch targets, movie-name parsing, the path-fix
- * for the game's own stale [MOVIES] alias, the borderless-window
- * approach to avoid disrupting the game's DirectDraw surface, the
- * window-refocus step) was built and iteratively debugged as a
- * standalone DLL first, using real trace-log evidence from actual
- * in-game testing across many rounds, and is CONFIRMED WORKING: a
- * custom HD movie plays correctly, and playback falls through cleanly
- * to the next original movie afterward.
- *
- * INTEGRATION NOTE, checked directly against the real darkpatch source
- * (header.h, detour.cpp, modmenu.cpp): this file installs its hooks the
- * same way this codebase's OWN internal-function hooks already work -
- * a raw 5-byte JMP write (exactly what WRITE_JMP/detour::hookFunc both
- * do here) plus a hand-built trampoline, since NEITHER of those two
- * provides one automatically. Real Microsoft Detours (DetourFunction)
- * IS available in this project (externals/detours.h/.lib) and DOES
- * provide trampolining, but this codebase's own convention reserves it
- * specifically for hooking standard Win32 API imports (CreateFileA,
- * FindFirstFileA, etc. in modmenu.cpp) - internal game functions like
- * the ones this file hooks are always done the simpler way. Matching
- * that convention, and reusing the exact mechanism already proven
- * working in real-game testing, felt like the right call over
- * introducing an untested alternative for something shipping to many
- * players. Logs through darkomen::detour::trace() - the same function
- * that writes trace.txt - so this integrates into the existing log
- * rather than creating a separate file.
+ * INTEGRATION NOTE: this file does its own byte-patching (VirtualProtect
+ * + a hand-built trampoline) rather than using this project's own
+ * HOOK_CALL/WRITE_JMP macros from header.h, since the real
+ * detour::hookFunc is a bare 5-byte JMP write with no trampoline - the
+ * manual trampoline here is necessary to still be able to call through
+ * to the original function for movies with no HD replacement.
  *
  * REQUIRES: ffplay.exe present in the same folder as darkpatch.dll
- * (i.e. PRG_ENG) - needs to be added to mod pack distribution alongside
- * this file. It's a real file (~147MB, from the FFmpeg project,
- * GPL-licensed) - large, but self-contained and needs no separate
- * install step.
- *
- * Addresses are hardcoded to the EngRel.exe build this project's
- * reverse-engineering work has been done against - confirmed correct
- * via direct disassembly and, separately, via extracting the actual
- * bytes from a real user's EngRel.exe and comparing. If a different
- * game build is ever in play, these would need re-verifying.
- *
- * TO INTEGRATE (3 steps, all confirmed against the real project files):
- *   1. Add this file to darkpatch.vcxproj (and .vcxproj.filters) as a
- *      ClCompile item, same as the other src/*.cpp files.
- *   2. In header.h, add this line alongside the other module
- *      declarations:
- *        namespace movie_hook { void Load(); void Unload(); }
- *   3. In dllmain.cpp's applyHooks(), add a call to movie_hook::Load();
- *      anywhere in the existing sequence of <module>::Load() calls
- *      (order doesn't matter relative to the others - this module is
- *      self-contained).
+ * (i.e. PRG_ENG).
  */
 
 #include "header.h"
 #include "detour.h"
 #include <stdio.h>
-#include <string.h>
+
+using namespace darkomen;
+
+/* Standard Windows idiom for getting the current module's own base
+   address without needing the HINSTANCE passed to DllMain stored
+   globally - the linker always provides this symbol pointing at the
+   start of the current module in memory. */
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+
+/* OCR_NORMAL/OCR_APPSTARTING are normally only declared when
+   OEMRESOURCE is defined before windows.h is included - header.h
+   (shared across the whole project) doesn't define it, so both are
+   defined here locally instead of touching that shared file. These
+   are stable, long-documented Win32 constants (standard cursor
+   resource IDs for SetSystemCursor), not something that changes
+   between SDK versions. */
+#ifndef OCR_NORMAL
+#define OCR_NORMAL 32512
+#endif
+#ifndef OCR_APPSTARTING
+#define OCR_APPSTARTING 32650
+#endif
 
 namespace movie_hook
 {
-using namespace darkomen;
 
 /* ---- Fixed addresses from the analyzed EngRel.exe build ---- */
 #define ADDR_RUNMOVIEPLAYBACKSTATEMACHINE 0x0042a090
 #define ADDR_READNEXTQUEUEDKEYEVENT       0x00482060
-#define PATCH_LEN 6   /* PUSH ESI (1 byte) + MOV EAX,[mem] (5 bytes) -
-                          disassembly-confirmed clean instruction
-                          boundary, >= the 5 bytes a JMP rel32 needs */
+#define PATCH_LEN 6
 #define CONTINUE_ADDR (ADDR_RUNMOVIEPLAYBACKSTATEMACHINE + PATCH_LEN)
 
 #define ADDR_MOVIESTREAM_CREATE 0x004913a0
-#define PATCH_LEN2 9  /* 4x single-byte PUSH + PUSH imm32 (5 bytes) -
-                          disassembly-confirmed */
+#define PATCH_LEN2 9
 #define CONTINUE_ADDR2 (ADDR_MOVIESTREAM_CREATE + PATCH_LEN2)
 
 typedef int (__cdecl *RunMovieFn)(const char *);
@@ -90,25 +67,29 @@ static MovieStreamCreateFn g_origMovieStreamCreate = NULL;
 static const ReadKeyFn readNextQueuedKeyEvent = (ReadKeyFn)ADDR_READNEXTQUEUEDKEYEVENT;
 
 static HANDLE g_ffplayProcess = NULL;
+static DWORD g_ffplayPid = 0;
+static HWND g_ffplayWindow = NULL;
+static volatile BOOL g_ffplayShown = FALSE;
+static HANDLE g_suppressThread = NULL;
 static BOOL g_active = FALSE;
 static char g_hdMoviesDir[MAX_PATH];
 static char g_realMoviesDir[MAX_PATH];
 static char g_ffplayPath[MAX_PATH];
 static BOOL g_ffplayAvailable = FALSE;
 
-/* Build a trampoline: original bytes we're overwriting, followed by a
-   jump back into the real function right after the patched region -
-   lets us still call the genuine original for movies with no HD
-   replacement. Same mechanism proven in the standalone build. */
-static void *build_trampoline(const unsigned char *originalBytes, int patchLen, int continueAddr)
+static void *build_trampoline_generic(const unsigned char *originalBytes, int patchLen, int continueAddr)
 {
     unsigned char *tramp = (unsigned char *)VirtualAlloc(
         NULL, patchLen + 5, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!tramp) return NULL;
+    if (!tramp)
+        return NULL;
+
     memcpy(tramp, originalBytes, patchLen);
+
     tramp[patchLen] = 0xE9;
     int rel = continueAddr - (int)(tramp + patchLen + 5);
     memcpy(tramp + patchLen + 1, &rel, 4);
+
     return tramp;
 }
 
@@ -125,9 +106,6 @@ static BOOL CALLBACK find_game_window_proc(HWND hwnd, LPARAM lParam)
     return TRUE;
 }
 
-/* ffplay running fullscreen can mark the game's own DirectDraw surface
-   "lost" - give the window a genuine chance to reclaim focus and let
-   the game's own surface-restore logic run before handing back control. */
 static void reclaim_game_focus(void)
 {
     g_gameWindow = NULL;
@@ -140,14 +118,84 @@ static void reclaim_game_focus(void)
     Sleep(300);
 }
 
-/* movieStream_Create path-fix. The game's own internal "[MOVIES]" path
-   alias can resolve to a stale/wrong absolute path rather than the
-   user's real install (confirmed via real trace-log evidence during
-   development - saw it resolve to a leftover developer path). If the
-   path we're given doesn't exist, retry with the real MOVIES folder
-   (derived at load time - see Load() below) + just the filename. Only
-   rewrites when the original path genuinely fails, so it can't affect
-   any path that already resolves correctly. */
+static BOOL CALLBACK find_ffplay_window_proc(HWND hwnd, LPARAM lParam)
+{
+    DWORD pid;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == g_ffplayPid) {
+        g_ffplayWindow = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* ffplay/SDL has its own built-in "hide cursor after inactivity"
+   behavior (confirmed against FFmpeg's real source - a hardcoded
+   CURSOR_HIDE_DELAY of exactly 1 second, not exposed as a runtime
+   flag) - it shows the cursor whenever its window gains focus, then
+   auto-hides it after that fixed delay. Rather than fight ffplay's own
+   timer, replace the actual system cursor RESOURCE with a blank one
+   for the duration of playback - this affects whatever's currently
+   displaying the standard arrow cursor regardless of which process
+   owns the window, then restores the real cursor via the standard
+   "reset to registry defaults" call once playback ends. Safe even if
+   ffplay is skipped or the movie ends unexpectedly, since both exit
+   paths call this. */
+static void hide_system_cursor(void)
+{
+    /* A 32x32 monochrome cursor needs each mask sized (width/8)*height =
+       4*32 = 128 bytes, NOT 4 - a genuine under-allocation here previously
+       left Windows reading ~124 bytes of uninitialized stack memory past
+       the end of a 4-byte array, producing an undefined/garbage cursor
+       image (which happened to render as a solid black square) instead
+       of the intended fully transparent one.
+       AND=1 (0xFF) + XOR=0 everywhere means "leave the destination pixel
+       unchanged" for every pixel - i.e. genuinely invisible, not just
+       black. */
+    unsigned char andMask[128];
+    unsigned char xorMask[128];
+    memset(andMask, 0xFF, sizeof(andMask));
+    memset(xorMask, 0x00, sizeof(xorMask));
+
+    /* Deliberately only OCR_NORMAL, not OCR_APPSTARTING - tried blanking
+       both, but real testing showed it made things worse: the app-
+       starting spinner then appeared on EVERY movie call, including
+       INTRO.TGQ's fallback to the original codec (no HD replacement, no
+       CreateProcess at all) - not just on genuine HD-replacement
+       launches. The user explicitly preferred the previous, simpler
+       behavior (a brief spinner once at real process startup only) over
+       that regression, so this reverts to OCR_NORMAL-only. */
+    HCURSOR blankNormal = CreateCursor(NULL, 0, 0, 32, 32, andMask, xorMask);
+    if (blankNormal)
+        SetSystemCursor(blankNormal, OCR_NORMAL);
+}
+
+static void restore_system_cursor(void)
+{
+    SystemParametersInfoA(SPI_SETCURSORS, 0, NULL, 0);
+}
+
+static DWORD WINAPI suppress_flash_thread(LPVOID param)
+{
+    for (int i = 0; i < 2500; i++) {
+        g_ffplayWindow = NULL;
+        EnumWindows(find_ffplay_window_proc, 0);
+        if (g_ffplayWindow) {
+            hide_system_cursor();
+            ShowWindow(g_ffplayWindow, SW_HIDE);
+            ShowWindow(g_ffplayWindow, SW_SHOW);
+            SetForegroundWindow(g_ffplayWindow);
+            g_ffplayShown = TRUE;
+            return 0;
+        }
+        Sleep(2);
+    }
+    detour::trace("suppress_flash_thread: never located ffplay's window "
+                   "(pid=%lu) after 5 seconds of tight polling",
+                   (unsigned long)g_ffplayPid);
+    return 0;
+}
+
 static int *__cdecl fixpath_movieStream_Create(const char *path, int flag, int *config)
 {
     const char *usePath = path;
@@ -170,9 +218,6 @@ static int *__cdecl fixpath_movieStream_Create(const char *path, int flag, int *
     return g_origMovieStreamCreate(usePath, flag, config);
 }
 
-/* Main replacement for runMoviePlaybackStateMachine - same signature/
-   calling convention as the original (__cdecl, one char* arg, int
-   return). Contract: 0=still playing, 1=skipped, 2=finished. */
 static int __cdecl hook_runMoviePlaybackStateMachine(const char *movieName)
 {
     *(int *)0x004d69e0 = 0;
@@ -180,9 +225,6 @@ static int __cdecl hook_runMoviePlaybackStateMachine(const char *movieName)
     *(int *)0x004d69b8 = 0;
 
     if (!g_active) {
-        /* Real argument looks like "[MOVIES]\eng.tgq" - bracketed path
-           alias, lowercase, .tgq included. Strip both to get the base
-           movie name for the HD lookup. */
         const char *afterPrefix = movieName;
         const char *lastSlash = strrchr(movieName, '\\');
         const char *lastBracket = strrchr(movieName, ']');
@@ -202,10 +244,6 @@ static int __cdecl hook_runMoviePlaybackStateMachine(const char *movieName)
             _snprintf(hdPath, sizeof(hdPath), "%s\\%s.mp4", g_hdMoviesDir, baseName);
 
             if (GetFileAttributesA(hdPath) != INVALID_FILE_ATTRIBUTES) {
-                /* Borderless window sized to the screen, not -fs (true
-                   exclusive fullscreen) - avoids disrupting the game's
-                   own DirectDraw surface, confirmed necessary by testing:
-                   -fs broke the following movie's playback, this doesn't. */
                 int screenW = GetSystemMetrics(SM_CXSCREEN);
                 int screenH = GetSystemMetrics(SM_CYSCREEN);
 
@@ -221,10 +259,16 @@ static int __cdecl hook_runMoviePlaybackStateMachine(const char *movieName)
                 si.cb = sizeof(si);
                 ZeroMemory(&pi, sizeof(pi));
 
-                if (CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+                if (CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
                     CloseHandle(pi.hThread);
                     g_ffplayProcess = pi.hProcess;
+                    g_ffplayPid = pi.dwProcessId;
+                    g_ffplayWindow = NULL;
+                    g_ffplayShown = FALSE;
                     g_active = TRUE;
+                    if (g_suppressThread)
+                        CloseHandle(g_suppressThread);
+                    g_suppressThread = CreateThread(NULL, 0, suppress_flash_thread, NULL, 0, NULL);
                     detour::trace("Playing HD replacement for '%s'", baseName);
                     return 0;
                 }
@@ -233,20 +277,17 @@ static int __cdecl hook_runMoviePlaybackStateMachine(const char *movieName)
             }
         }
 
-        /* No HD replacement (or ffplay unavailable/failed) - completely
-           transparent fallback to the real, original function. */
         return g_origRunMovie(movieName);
     }
 
-    /* Mid-playback of our HD replacement - poll, matching the original
-       function's own per-frame poll contract exactly. */
     unsigned short key = readNextQueuedKeyEvent();
     unsigned char scancode = (unsigned char)((key >> 8) & 0xFF);
-    if (scancode == 0x39 || scancode == 0x01) { /* Space or Escape */
+    if (scancode == 0x39 || scancode == 0x01) {
         TerminateProcess(g_ffplayProcess, 0);
         CloseHandle(g_ffplayProcess);
         g_ffplayProcess = NULL;
         g_active = FALSE;
+        restore_system_cursor();
         reclaim_game_focus();
         return 1;
     }
@@ -255,6 +296,7 @@ static int __cdecl hook_runMoviePlaybackStateMachine(const char *movieName)
         CloseHandle(g_ffplayProcess);
         g_ffplayProcess = NULL;
         g_active = FALSE;
+        restore_system_cursor();
         reclaim_game_focus();
         return 2;
     }
@@ -265,14 +307,14 @@ static int __cdecl hook_runMoviePlaybackStateMachine(const char *movieName)
 static BOOL patch_entry(void *targetAddr, int patchLen, int continueAddr, void *replacementFn, void **outOrig)
 {
     unsigned char *target = (unsigned char *)targetAddr;
-    unsigned char originalBytes[16]; /* patchLen never exceeds this */
+    unsigned char originalBytes[16];
     DWORD oldProtect;
 
     if (!VirtualProtect(target, patchLen, PAGE_EXECUTE_READWRITE, &oldProtect))
         return FALSE;
 
     memcpy(originalBytes, target, patchLen);
-    *outOrig = build_trampoline(originalBytes, patchLen, continueAddr);
+    *outOrig = build_trampoline_generic(originalBytes, patchLen, continueAddr);
     if (!*outOrig) {
         VirtualProtect(target, patchLen, oldProtect, &oldProtect);
         return FALSE;
@@ -291,34 +333,26 @@ static BOOL patch_entry(void *targetAddr, int patchLen, int continueAddr, void *
 
 void Load()
 {
-    detour::trace("Hooking Movie Playback");
+    /* Cheap insurance: if a previous session somehow crashed mid-
+       playback with the system cursor still swapped to blank, this
+       resets it back to the real one on every fresh load - harmless
+       no-op if the cursor was already normal. */
+    restore_system_cursor();
 
-    /* Matches modmenu.cpp's own established approach exactly:
-       GetModuleFileNameA(NULL, ...) gives the running EXE's path
-       (EngRel.exe, in PRG_ENG) regardless of which DLL calls it, then
-       stripping the path twice gets from ".../PRG_ENG/EngRel.exe" to
-       ".../PRG_ENG" to the game's root folder - the same logic already
-       proven working for locating the "Mods" folder. MOVIES is a
-       sibling of PRG_ENG in every known install layout (CD, GOG, Steam),
-       so this generalizes across all of them without special-casing. */
-    char exePath[MAX_PATH];
-    GetModuleFileNameA(NULL, exePath, MAX_PATH);
-    char *lastSlash = strrchr(exePath, '\\');
-    if (lastSlash) *lastSlash = '\0'; // exePath is now PRG_ENG
+    char selfPath[MAX_PATH];
+    GetModuleFileNameA((HINSTANCE)&__ImageBase, selfPath, MAX_PATH);
+    char *lastSlash = strrchr(selfPath, '\\');
+    if (lastSlash) *lastSlash = '\0';
 
-    char prgEngPath[MAX_PATH];
-    strncpy(prgEngPath, exePath, sizeof(prgEngPath) - 1);
-    prgEngPath[sizeof(prgEngPath) - 1] = '\0';
+    char parentPath[MAX_PATH];
+    strncpy(parentPath, selfPath, sizeof(parentPath) - 1);
+    parentPath[sizeof(parentPath) - 1] = '\0';
+    char *parentSlash = strrchr(parentPath, '\\');
+    if (parentSlash) *parentSlash = '\0';
 
-    char rootPath[MAX_PATH];
-    strncpy(rootPath, exePath, sizeof(rootPath) - 1);
-    rootPath[sizeof(rootPath) - 1] = '\0';
-    char *rootSlash = strrchr(rootPath, '\\');
-    if (rootSlash) *rootSlash = '\0'; // rootPath is now the game root
-
-    _snprintf(g_realMoviesDir, sizeof(g_realMoviesDir), "%s\\MOVIES", rootPath);
-    _snprintf(g_hdMoviesDir, sizeof(g_hdMoviesDir), "%s\\HDMovies", rootPath);
-    _snprintf(g_ffplayPath, sizeof(g_ffplayPath), "%s\\ffplay.exe", prgEngPath);
+    _snprintf(g_realMoviesDir, sizeof(g_realMoviesDir), "%s\\MOVIES", parentPath);
+    _snprintf(g_hdMoviesDir, sizeof(g_hdMoviesDir), "%s\\HDMovies", parentPath);
+    _snprintf(g_ffplayPath, sizeof(g_ffplayPath), "%s\\ffplay.exe", selfPath);
     g_ffplayAvailable = (GetFileAttributesA(g_ffplayPath) != INVALID_FILE_ATTRIBUTES);
 
     if (!g_ffplayAvailable) {
