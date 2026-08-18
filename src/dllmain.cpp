@@ -41,6 +41,12 @@ void applyHooks()
 
 	//darkomen::ctl::applyHooksCTL();
 	darkomen::detour::init();
+
+	// Install the 256-colour sprite path and the sixth 256x256 resource class
+	// before the remaining content/runtime hooks.  The module validates the
+	// expected EngRel bytes before applying anything.
+	sprite_256::Load();
+
 	darkomen::modmenu::applyHooks();
 	
 	dgvoodoo::Load();
