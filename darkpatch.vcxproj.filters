@@ -36,6 +36,9 @@
     <ClCompile Include="src\string_table.cpp">
       <Filter>Quelldateien</Filter>
     </ClCompile>
+    <ClCompile Include="src\sprite_256.cpp">
+      <Filter>Quelldateien</Filter>
+    </ClCompile>
     <ClCompile Include="src\whmtg.cpp">
       <Filter>Quelldateien</Filter>
     </ClCompile>
