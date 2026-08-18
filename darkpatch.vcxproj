@@ -109,6 +109,7 @@
     <ClCompile Include="src\no_cd.cpp" />
     <ClCompile Include="src\portrait_bk.cpp" />
     <ClCompile Include="src\string_table.cpp" />
+    <ClCompile Include="src\sprite_256.cpp" />
     <ClCompile Include="src\util.cpp" />
     <ClCompile Include="src\whmtg.cpp" />
     <ClCompile Include="src\xslots.cpp" />
