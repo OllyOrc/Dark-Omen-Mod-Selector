@@ -1,0 +1,91 @@
+Darkpatch runtime 256-colour + 256x256 sprite patch
+===================================================
+
+What was ported
+---------------
+1. Stage4H full 8-bit / 256-colour sprite path.
+   The exact tested 0x800-byte .spr8 payload is compiled into darkpatch and copied
+   to executable process memory at DLL load. External rel32 CALL/JMP targets are
+   relocated for the runtime allocation.
+
+2. Stage8E resource-class expansion.
+   The original classes are retained:
+     32x32, 32x64, 64x32, 64x64, 128x128
+   and a sixth class is added:
+     256x256
+
+   The six-row template is allocated in writable memory because Dark Omen's
+   initializer at 0x004428F0 writes derived values back into the source records.
+
+Why this is preferable to editing EngRel.exe
+---------------------------------------------
+The DLL installs the changes in memory on process attach. The on-disk EngRel.exe
+can remain the known original build, reducing the need to maintain many modified
+executables as darkpatch grows.
+
+Compatibility guard
+-------------------
+Before writing anything, sprite_256::Load verifies every Stage4H hook site plus
+Stage8E's original `push 5` and template pointer bytes. If the executable does
+not match the expected EngRel build, the whole sprite patch is skipped and a
+message is written through darkpatch's Log() function.
+
+Validated in-game status — 18 August 2026
+-----------------------------------------
+This runtime DLL port has now passed representative in-game testing:
+
+A. BERNHD.SPR displays the diagnostic magenta dots used to prove the full
+   256-colour / palette-index-255 path is working.
+
+B. The existing double-sized Dread King displays successfully in 3D mode.
+   This sprite previously crashed before the additional 256x256 resource class
+   was introduced.
+
+These tests confirm that both the 256-colour patch and the additional 256x256
+resource class work when supplied by darkpatch.dll rather than a permanently
+modified EngRel.exe.
+
+The runtime class list is therefore:
+  32x32
+  32x64
+  64x32
+  64x64
+  128x128
+  256x256
+
+128x128 has NOT been replaced; 256x256 is a separate sixth class.
+
+Test baseline used to create this port
+--------------------------------------
+Original EngRel SHA-256:
+  0baa18431677d58b06be3126b15c4cd2c8911df115c5bcc33efb146629937f95
+
+Stage4H SHA-256:
+  f7d8ef839ffc42478827d846e51e6eeb3aacc8de496f987e6cd51478937a0d7c
+
+Stage8E SHA-256:
+  587f35ede6abec88d58c958f31d2f4876243075071e54460447ef202d7e466b8
+
+Recommended continuing regression tests
+---------------------------------------
+A. Keep the current sprite_256 implementation frozen while testing.
+B. Test several ordinary <=128 sprites.
+C. Test BERNHD and other genuine paletteSize=256 sprites.
+D. Test the double-sized Dread King through all actions and rotations.
+E. Test mixed legacy, 256-colour and >128 units in the same battle.
+F. Test several maps and camera zoom/rotation states.
+G. Re-run controlled 255/256/257 frame-boundary tests before calling the
+   runtime patch fully production-regression-complete.
+
+Payload source layout
+---------------------
+For repository readability, the exact 0x800-byte Stage4H payload is split into
+four .inc files:
+  src/sprite_256_payload_0.inc
+  src/sprite_256_payload_1.inc
+  src/sprite_256_payload_2.inc
+  src/sprite_256_payload_3.inc
+
+They are included consecutively into kSpr8Code and together contain exactly
+2048 bytes. This is only source-code organisation; the runtime payload and hook
+logic remain the same.
