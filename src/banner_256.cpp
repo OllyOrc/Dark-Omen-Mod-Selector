@@ -2,9 +2,10 @@
 // resource classes, while applying a zoom-aware anchor correction only to the
 // new 256x256 body class. Hooks E/F/G capture and associate the homogeneous W
 // divisor with the true live unit. Hook B then raises the shared overlay /
-// interaction anchor by round(K / |W|), with K initially calibrated to 1080.
-// F11 retains the DisplayOverlays calibration toggle for convenient visual
-// validation. Original sprite classes remain unchanged.
+// interaction anchor by round(K / |W|), with K increased to 1300 after the
+// K=1080 zoom sweep consistently placed the banner at head height rather than
+// overhead. F11 retains the DisplayOverlays calibration toggle for convenient
+// visual validation. Original sprite classes remain unchanged.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -47,7 +48,7 @@ namespace banner_256
     static const DWORD RENDER_HEIGHT_TERM = 0x00502B6C;
     static const DWORD CAMERA_UP_Y        = 0x00502B84;
     static const DWORD DISPLAY_OVERLAYS    = 0x004BF0F0;
-    static const float ANCHOR_K_256        = 1080.0f;
+    static const float ANCHOR_K_256        = 1300.0f;
 
     struct UNIT_STATE
     {
@@ -463,7 +464,7 @@ namespace banner_256
         WriteJump(HOOK_ANCHOR,(DWORD)(g_caves+0xC0),7);
         FlushInstructionCache(GetCurrentProcess(),NULL,0);
         g_loaded=TRUE;
-        darkomen::detour::trace("Stage10 installed: Hook-G stableW + K=1080 zoom-aware 256 anchor correction active; F11 DisplayOverlays diagnostic retained");
+        darkomen::detour::trace("Stage10 installed: Hook-G stableW + K=1300 zoom-aware 256 anchor correction active; F11 DisplayOverlays diagnostic retained");
         darkomen::detour::trace("Stage10 overlayCalibration initial DisplayOverlays=%lu; press F11 to toggle", g_originalDisplayOverlays);
         FlushTrace();
     }
