@@ -68,6 +68,7 @@ namespace banner_256
         DWORD lastProjectionSequenceSeen;
         float lastLoggedProjectionW;
         DWORD projectionLogCount;
+        DWORD lastProjectionLogTick;
     };
 
     struct ENTRY_UNIT_LINK
@@ -298,21 +299,21 @@ namespace banner_256
         }
 
         if (state->is256 && state->projectionWBits != 0 &&
-            state->projectionSequence != state->lastProjectionSequenceSeen &&
-            state->projectionLogCount < 24)
+            state->projectionSequence != state->lastProjectionSequenceSeen)
         {
             union FLOAT_BITS { DWORD bits; float value; } wBits;
             wBits.bits = state->projectionWBits;
             const float w = wBits.value;
             const float absW = (w < 0.0f) ? -w : w;
-            float delta = w - state->lastLoggedProjectionW;
-            if (delta < 0.0f) delta = -delta;
+            const DWORD now = GetTickCount();
             if (absW > 0.0001f && absW < 1000000.0f &&
-                (state->projectionLogCount == 0 || delta >= 0.25f))
+                (state->projectionLogCount == 0 ||
+                 (DWORD)(now - state->lastProjectionLogTick) >= 500))
             {
                 const LONG screenY = *((volatile LONG*)0x00503714);
-                darkomen::detour::trace("Stage10 projectionW unit=%08lX W=%.6f screenY=%ld source=%c sample=%lu seq=%lu", unit, w, screenY, (state->projectionSource == 2) ? 'F' : 'E', state->projectionLogCount + 1, state->projectionSequence);
+                darkomen::detour::trace("Stage10 stableW unit=%08lX W=%.6f screenY=%ld source=%c sample=%lu seq=%lu", unit, w, screenY, (state->projectionSource == 2) ? 'F' : 'E', state->projectionLogCount + 1, state->projectionSequence);
                 FlushTrace();
+                state->lastProjectionLogTick = now;
                 state->lastLoggedProjectionW = w;
                 ++state->projectionLogCount;
             }
@@ -431,7 +432,7 @@ namespace banner_256
         WriteJump(HOOK_ANCHOR,(DWORD)(g_caves+0xC0),7);
         FlushInstructionCache(GetCurrentProcess(),NULL,0);
         g_loaded=TRUE;
-        darkomen::detour::trace("Stage10 installed: Hook-G projection owner diagnostic active; correction unchanged"); FlushTrace();
+        darkomen::detour::trace("Stage10 installed: Hook-G stableW calibration diagnostic active; correction unchanged"); FlushTrace();
     }
 
     void Unload()
