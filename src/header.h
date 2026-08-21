@@ -27,6 +27,7 @@ namespace multiplayer_scene { void Load(); void Unload(); }
 namespace dgvoodoo			{ void Load(); void Unload(); }
 namespace movie_hook { void Load(); void Unload(); }
 namespace sprite_256       { void Load(); void Unload(); }
+namespace banner_256       { void Load(); void Unload(); }
 
 // helpers.cpp
 char* ReadInFile( const char* szFileName );
