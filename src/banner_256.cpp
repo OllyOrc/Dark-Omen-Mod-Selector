@@ -24,6 +24,7 @@
 // No game structure is repurposed.  The entry->unit association and per-unit
 // class/rendered-height state are entirely DLL-owned.
 #include "header.h"
+#include "detour.h"
 #include <string.h>
 
 namespace banner_256
@@ -56,6 +57,11 @@ namespace banner_256
         DWORD unit;
         BOOL is256;
         float renderedHeight;
+        BOOL loggedClass256;
+        BOOL loggedSuppressedFalse;
+        BOOL loggedEntry;
+        BOOL loggedHeight;
+        BOOL loggedRaise;
     };
 
     struct ENTRY_UNIT_LINK
@@ -70,6 +76,12 @@ namespace banner_256
 
     static BYTE* g_caves = NULL;
     static BOOL g_loaded = FALSE;
+
+    static void FlushTrace()
+    {
+        if (darkomen::detour::traceFile != NULL)
+            fflush(darkomen::detour::traceFile);
+    }
 
     static BOOL BytesEqual(DWORD address, const BYTE* expected, DWORD count)
     {
@@ -117,9 +129,8 @@ namespace banner_256
 
         if (freeSlot >= _countof(g_units)) return NULL;
 
+        memset(&g_units[freeSlot], 0, sizeof(g_units[freeSlot]));
         g_units[freeSlot].unit = unit;
-        g_units[freeSlot].is256 = FALSE;
-        g_units[freeSlot].renderedHeight = 0.0f;
         return &g_units[freeSlot];
     }
 
@@ -132,8 +143,38 @@ namespace banner_256
         const BOOL is256 = (width == 256 && height == 256) ? TRUE : FALSE;
 
         UNIT_STATE* state = FindOrCreateUnitState(unit);
-        if (state != NULL)
-            state->is256 = is256;
+        if (state == NULL) return;
+
+        if (is256)
+        {
+            // Stage9C could silently lose TRUE if the same unit later passed
+            // Hook A for another ordinary-sized render resource.  For this
+            // diagnostic build, TRUE is sticky for the unit once positively
+            // proven by a 256x256 template.
+            state->is256 = TRUE;
+            if (!state->loggedClass256)
+            {
+                darkomen::detour::trace("Stage10 class256 detected unit=%08lX template=%08lX width=%lu height=%lu",
+                    unit, templateEntry, width, height);
+                FlushTrace();
+                state->loggedClass256 = TRUE;
+            }
+            return;
+        }
+
+        if (state->is256)
+        {
+            if (!state->loggedSuppressedFalse)
+            {
+                darkomen::detour::trace("Stage10 suppressed TRUE->FALSE unit=%08lX template=%08lX width=%lu height=%lu",
+                    unit, templateEntry, width, height);
+                FlushTrace();
+                state->loggedSuppressedFalse = TRUE;
+            }
+            return;
+        }
+
+        state->is256 = FALSE;
     }
 
     static void __cdecl RecordEntryUnit(DWORD entry, DWORD unit)
@@ -146,6 +187,13 @@ namespace banner_256
             if (g_entryToUnit[i].entry == entry)
             {
                 g_entryToUnit[i].unit = unit;
+                UNIT_STATE* state = FindUnitState(unit);
+                if (state != NULL && state->is256 && !state->loggedEntry)
+                {
+                    darkomen::detour::trace("Stage10 entryToUnit populated unit=%08lX entry=%08lX", unit, entry);
+                    FlushTrace();
+                    state->loggedEntry = TRUE;
+                }
                 return;
             }
             if (freeSlot == _countof(g_entryToUnit) && g_entryToUnit[i].entry == 0)
@@ -156,6 +204,14 @@ namespace banner_256
         {
             g_entryToUnit[freeSlot].entry = entry;
             g_entryToUnit[freeSlot].unit = unit;
+
+            UNIT_STATE* state = FindUnitState(unit);
+            if (state != NULL && state->is256 && !state->loggedEntry)
+            {
+                darkomen::detour::trace("Stage10 entryToUnit populated unit=%08lX entry=%08lX", unit, entry);
+                FlushTrace();
+                state->loggedEntry = TRUE;
+            }
         }
     }
 
@@ -205,7 +261,16 @@ namespace banner_256
 
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state != NULL)
+        {
             state->renderedHeight = renderedHeight;
+            if (state->is256 && !state->loggedHeight)
+            {
+                darkomen::detour::trace("Stage10 renderedHeight unit=%08lX entry=%08lX h=%.3f frameScale=%.6f resource=%.6f upY=%.6f",
+                    unit, entry, renderedHeight, frameScale, resourceTerm, cameraUpY);
+                FlushTrace();
+                state->loggedHeight = TRUE;
+            }
+        }
     }
 
     static int __cdecl GetUnitAnchorRaise(DWORD unit)
@@ -220,7 +285,16 @@ namespace banner_256
         // compared with 128: 64/256 == 0.25.  h is positive, so +0.5 gives a
         // stable nearest-pixel integer before Hook B subtracts it from anchorY.
         const int raise = (int)(h * 0.25f + 0.5f);
-        return (raise > 0 && raise < 1024) ? raise : 0;
+        const int safeRaise = (raise > 0 && raise < 1024) ? raise : 0;
+
+        if (safeRaise > 0 && !state->loggedRaise)
+        {
+            darkomen::detour::trace("Stage10 anchorRaise unit=%08lX h=%.3f raise=%d", unit, h, safeRaise);
+            FlushTrace();
+            state->loggedRaise = TRUE;
+        }
+
+        return safeRaise;
     }
 
     static BOOL BuildCaves()
@@ -343,21 +417,25 @@ namespace banner_256
         if (!BytesEqual(HOOK_CLASSIFY, kOriginalClassify, sizeof(kOriginalClassify)))
         {
             Log("banner_256: EngRel mismatch at 0x0042B84F; Stage10 not installed");
+            darkomen::detour::trace("Stage10 install FAIL byte-guard 0x0042B84F"); FlushTrace();
             return;
         }
         if (!BytesEqual(HOOK_ENTRY, kOriginalEntry, sizeof(kOriginalEntry)))
         {
             Log("banner_256: EngRel mismatch at 0x0042B97F; Stage10 not installed");
+            darkomen::detour::trace("Stage10 install FAIL byte-guard 0x0042B97F"); FlushTrace();
             return;
         }
         if (!BytesEqual(HOOK_RENDER, kOriginalRender, sizeof(kOriginalRender)))
         {
             Log("banner_256: EngRel mismatch at 0x00442B49; Stage10 not installed");
+            darkomen::detour::trace("Stage10 install FAIL byte-guard 0x00442B49"); FlushTrace();
             return;
         }
         if (!BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)))
         {
             Log("banner_256: EngRel mismatch at 0x004504B8; Stage10 not installed");
+            darkomen::detour::trace("Stage10 install FAIL byte-guard 0x004504B8"); FlushTrace();
             return;
         }
 
@@ -373,7 +451,9 @@ namespace banner_256
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
 
         g_loaded = TRUE;
-        Log("banner_256: Stage10 installed; 256x256 overlay/interaction Y tracks 1/4 of rendered body height");
+        Log("banner_256: Stage10 diagnostic installed; sticky class256 and rendered-height Y correction active");
+        darkomen::detour::trace("Stage10 installed: sticky class256 + diagnostic trace active");
+        FlushTrace();
     }
 
     void Unload()
