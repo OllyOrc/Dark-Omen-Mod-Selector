@@ -8,9 +8,11 @@
 // computeUnitScreenBounds immediately before CALL 0x00427C30, where ESI is
 // still the true unit pointer, and publishes that pointer for E/F to associate
 // with the nested projection sample. The stable-W sampler records valid W at a
-// low fixed time cadence even when the camera is stationary. F11 temporarily
-// moves only the positively classified 256x256 unit overlay/interaction anchor
-// far off-screen for calibration, leaving the body sprite and normal HUD alone.
+// low fixed time cadence even when the camera is stationary.
+//
+// Calibration-only F11 mode now suppresses the three 256-unit banner composite
+// enqueue calls (emblem, arrow and border) while ESI still holds the live unit
+// pointer. This leaves the body sprite, camera and all normal units untouched.
 // No shipping visual anchor formula change is made here.
 #include "header.h"
 #include "detour.h"
@@ -25,6 +27,9 @@ namespace banner_256
     static const DWORD HOOK_PROJECTION_F   = 0x0043FE24;
     static const DWORD HOOK_PROJECTION_G   = 0x00450427;
     static const DWORD HOOK_ANCHOR         = 0x004504B8;
+    static const DWORD HOOK_BANNER_EMBLEM  = 0x0045010B;
+    static const DWORD HOOK_BANNER_ARROW   = 0x00450146;
+    static const DWORD HOOK_BANNER_BORDER  = 0x004501B9;
 
     static const DWORD RETURN_CLASSIFY     = 0x0042B854;
     static const DWORD RETURN_ENTRY        = 0x0042B986;
@@ -33,8 +38,12 @@ namespace banner_256
     static const DWORD RETURN_PROJECTION_F = 0x0043FE2A;
     static const DWORD RETURN_PROJECTION_G = 0x0045042C;
     static const DWORD RETURN_ANCHOR       = 0x004504BF;
+    static const DWORD RETURN_BANNER_EMBLEM = 0x00450110;
+    static const DWORD RETURN_BANNER_ARROW  = 0x0045014B;
+    static const DWORD RETURN_BANNER_BORDER = 0x004501BE;
 
     static const DWORD CALL_PROJECT_BUFFER = 0x00427C30;
+    static const DWORD CALL_PUSH_ICON_RECORD = 0x004521D0;
 
     static const BYTE kOriginalClassify[5] =
         { 0x8B,0x6F,0x48,0x85,0xED };
@@ -50,10 +59,15 @@ namespace banner_256
         { 0xE8,0x04,0x78,0xFD,0xFF };
     static const BYTE kOriginalAnchor[7] =
         { 0xA1,0x14,0x37,0x50,0x00,0x2B,0xC2 };
+    static const BYTE kOriginalBannerEmblem[5] =
+        { 0xE8,0xC0,0x20,0x00,0x00 };
+    static const BYTE kOriginalBannerArrow[5] =
+        { 0xE8,0x85,0x20,0x00,0x00 };
+    static const BYTE kOriginalBannerBorder[5] =
+        { 0xE8,0x12,0x20,0x00,0x00 };
 
     static const DWORD RENDER_HEIGHT_TERM = 0x00502B6C;
     static const DWORD CAMERA_UP_Y        = 0x00502B84;
-    static const int CALIBRATION_HIDE_RAISE = 4096;
 
     struct UNIT_STATE
     {
@@ -94,9 +108,12 @@ namespace banner_256
     static volatile DWORD g_lastProjectionWBits = 0;
     static volatile DWORD g_lastProjectionSource = 0;
     static volatile DWORD g_projectionSequence = 0;
+    static volatile DWORD g_bannerSuppressScratch = 0;
 
     static BOOL g_bannerToggleKeyWasDown = FALSE;
     static BOOL g_hide256BannerForCalibration = FALSE;
+    static BOOL g_loggedBannerSuppressHit = FALSE;
+    static DWORD g_lastBannerToggleTick = 0;
 
     static void FlushTrace()
     {
@@ -109,11 +126,19 @@ namespace banner_256
         const BOOL keyDown = (GetAsyncKeyState(VK_F11) & 0x8000) ? TRUE : FALSE;
         if (keyDown && !g_bannerToggleKeyWasDown)
         {
-            g_hide256BannerForCalibration = g_hide256BannerForCalibration ? FALSE : TRUE;
-            darkomen::detour::trace(
-                "Stage10 bannerToggle key=F11 hide256Banner=%lu",
-                g_hide256BannerForCalibration ? 1UL : 0UL);
-            FlushTrace();
+            const DWORD now = GetTickCount();
+            if (g_lastBannerToggleTick == 0 ||
+                (DWORD)(now - g_lastBannerToggleTick) >= 300)
+            {
+                g_hide256BannerForCalibration = g_hide256BannerForCalibration ? FALSE : TRUE;
+                g_lastBannerToggleTick = now;
+                if (g_hide256BannerForCalibration)
+                    g_loggedBannerSuppressHit = FALSE;
+                darkomen::detour::trace(
+                    "Stage10 bannerToggle key=F11 hide256Banner=%lu",
+                    g_hide256BannerForCalibration ? 1UL : 0UL);
+                FlushTrace();
+            }
         }
         g_bannerToggleKeyWasDown = keyDown;
     }
@@ -158,6 +183,20 @@ namespace banner_256
         memset(&g_units[freeSlot], 0, sizeof(g_units[freeSlot]));
         g_units[freeSlot].unit = unit;
         return &g_units[freeSlot];
+    }
+
+    static BOOL __cdecl ShouldSuppress256Banner(DWORD unit)
+    {
+        if (!g_hide256BannerForCalibration || unit == 0) return FALSE;
+        UNIT_STATE* state = FindUnitState(unit);
+        if (state == NULL || !state->is256) return FALSE;
+        if (!g_loggedBannerSuppressHit)
+        {
+            darkomen::detour::trace("Stage10 bannerSuppress active unit=%08lX", unit);
+            FlushTrace();
+            g_loggedBannerSuppressHit = TRUE;
+        }
+        return TRUE;
     }
 
     static void __cdecl MarkUnitClass(DWORD unit, DWORD templateEntry)
@@ -346,13 +385,6 @@ namespace banner_256
         }
 
         if (!state->is256) return 0;
-
-        // Calibration-only hide: Hook B is the proven shared 256-unit overlay /
-        // interaction anchor. Moving it far above the viewport removes the
-        // Dread King banner without changing the body sprite or normal HUD.
-        if (g_hide256BannerForCalibration)
-            return CALIBRATION_HIDE_RAISE;
-
         const float h = state->renderedHeight;
         if (!(h > 0.0f && h < 4096.0f)) return 0;
         const int raise = (int)(h * 0.25f + 0.5f);
@@ -363,6 +395,32 @@ namespace banner_256
             FlushTrace(); state->loggedRaise = TRUE;
         }
         return safeRaise;
+    }
+
+    static void BuildBannerSuppressCave(BYTE* cave, DWORD returnAddress)
+    {
+        DWORD n = 0;
+        cave[n++] = 0x9C;                         // pushfd
+        cave[n++] = 0x60;                         // pushad
+        cave[n++] = 0x56;                         // push esi (live unit)
+        DWORD callCheck = n; cave[n++] = 0xE8; n += 4;
+        cave[n++] = 0x83; cave[n++] = 0xC4; cave[n++] = 0x04;
+        cave[n++] = 0xA3; *((DWORD*)(cave + n)) = (DWORD)&g_bannerSuppressScratch; n += 4;
+        cave[n++] = 0x61;                         // popad; original flags remain stacked
+        cave[n++] = 0x83; cave[n++] = 0x3D;
+        *((DWORD*)(cave + n)) = (DWORD)&g_bannerSuppressScratch; n += 4;
+        cave[n++] = 0x00;                         // cmp dword ptr [scratch],0
+        cave[n++] = 0x75; cave[n++] = 0x0B;       // jne suppressed
+        cave[n++] = 0x9D;                         // popfd
+        DWORD callOriginal = n; cave[n++] = 0xE8; n += 4;
+        DWORD jumpNormal = n; cave[n++] = 0xE9; n += 4;
+        cave[n++] = 0x9D;                         // suppressed: restore original flags
+        DWORD jumpSuppressed = n; cave[n++] = 0xE9; n += 4;
+
+        WriteRel32(cave + callCheck, (DWORD)&ShouldSuppress256Banner);
+        WriteRel32(cave + callOriginal, CALL_PUSH_ICON_RECORD);
+        WriteRel32(cave + jumpNormal, returnAddress);
+        WriteRel32(cave + jumpSuppressed, returnAddress);
     }
 
     static BOOL BuildCaves()
@@ -427,14 +485,16 @@ namespace banner_256
         WriteRel32(f + callF, (DWORD)&RecordProjectionWFromF); WriteRel32(f + jumpF, RETURN_PROJECTION_F);
 
         BYTE* g = g_caves + 0x180; n = 0;
-        // Hook G: ESI is the true computeUnitScreenBounds unit. The original
-        // CALL argument has already been pushed, so stashing ESI is transparent.
         g[n++] = 0x89; g[n++] = 0x35;
         *((DWORD*)(g + n)) = (DWORD)&g_currentProjectionUnit; n += 4;
         DWORD callG = n; g[n++] = 0xE8; n += 4;
         DWORD jumpG = n; g[n++] = 0xE9; n += 4;
         WriteRel32(g + callG, CALL_PROJECT_BUFFER);
         WriteRel32(g + jumpG, RETURN_PROJECTION_G);
+
+        BuildBannerSuppressCave(g_caves + 0x1C0, RETURN_BANNER_EMBLEM);
+        BuildBannerSuppressCave(g_caves + 0x200, RETURN_BANNER_ARROW);
+        BuildBannerSuppressCave(g_caves + 0x240, RETURN_BANNER_BORDER);
 
         FlushInstructionCache(GetCurrentProcess(), g_caves, 0x400); return TRUE;
     }
@@ -448,14 +508,20 @@ namespace banner_256
             !BytesEqual(HOOK_PROJECTION_E,kOriginalProjectionE,sizeof(kOriginalProjectionE)) ||
             !BytesEqual(HOOK_PROJECTION_F,kOriginalProjectionF,sizeof(kOriginalProjectionF)) ||
             !BytesEqual(HOOK_PROJECTION_G,kOriginalProjectionG,sizeof(kOriginalProjectionG)) ||
-            !BytesEqual(HOOK_ANCHOR,kOriginalAnchor,sizeof(kOriginalAnchor)))
+            !BytesEqual(HOOK_ANCHOR,kOriginalAnchor,sizeof(kOriginalAnchor)) ||
+            !BytesEqual(HOOK_BANNER_EMBLEM,kOriginalBannerEmblem,sizeof(kOriginalBannerEmblem)) ||
+            !BytesEqual(HOOK_BANNER_ARROW,kOriginalBannerArrow,sizeof(kOriginalBannerArrow)) ||
+            !BytesEqual(HOOK_BANNER_BORDER,kOriginalBannerBorder,sizeof(kOriginalBannerBorder)))
         {
             darkomen::detour::trace("Stage10 install FAIL byte guard"); FlushTrace(); return;
         }
         memset(g_units,0,sizeof(g_units)); memset(g_entryToUnit,0,sizeof(g_entryToUnit));
         g_projectionWScratchBits = g_currentProjectionUnit = g_lastProjectionUnit = g_lastProjectionWBits = g_lastProjectionSource = g_projectionSequence = 0;
+        g_bannerSuppressScratch = 0;
         g_bannerToggleKeyWasDown = FALSE;
         g_hide256BannerForCalibration = FALSE;
+        g_loggedBannerSuppressHit = FALSE;
+        g_lastBannerToggleTick = 0;
         if (!BuildCaves()) return;
         WriteJump(HOOK_CLASSIFY,(DWORD)(g_caves+0x00),5);
         WriteJump(HOOK_ENTRY,(DWORD)(g_caves+0x40),7);
@@ -464,10 +530,13 @@ namespace banner_256
         WriteJump(HOOK_PROJECTION_F,(DWORD)(g_caves+0x140),6);
         WriteJump(HOOK_PROJECTION_G,(DWORD)(g_caves+0x180),5);
         WriteJump(HOOK_ANCHOR,(DWORD)(g_caves+0xC0),7);
+        WriteJump(HOOK_BANNER_EMBLEM,(DWORD)(g_caves+0x1C0),5);
+        WriteJump(HOOK_BANNER_ARROW,(DWORD)(g_caves+0x200),5);
+        WriteJump(HOOK_BANNER_BORDER,(DWORD)(g_caves+0x240),5);
         FlushInstructionCache(GetCurrentProcess(),NULL,0);
         g_loaded=TRUE;
-        darkomen::detour::trace("Stage10 installed: Hook-G stableW + F11 256-banner hide calibration diagnostic active; correction unchanged");
-        darkomen::detour::trace("Stage10 bannerCalibration initial hide256Banner=0; press F11 to toggle");
+        darkomen::detour::trace("Stage10 installed: Hook-G stableW + F11 256-banner enqueue suppression diagnostic active; correction unchanged");
+        darkomen::detour::trace("Stage10 bannerCalibration initial hide256Banner=0; press F11 to suppress emblem+arrow+border");
         FlushTrace();
     }
 
@@ -481,14 +550,20 @@ namespace banner_256
         memcpy((void*)HOOK_PROJECTION_F,kOriginalProjectionF,sizeof(kOriginalProjectionF));
         memcpy((void*)HOOK_PROJECTION_G,kOriginalProjectionG,sizeof(kOriginalProjectionG));
         memcpy((void*)HOOK_ANCHOR,kOriginalAnchor,sizeof(kOriginalAnchor));
+        memcpy((void*)HOOK_BANNER_EMBLEM,kOriginalBannerEmblem,sizeof(kOriginalBannerEmblem));
+        memcpy((void*)HOOK_BANNER_ARROW,kOriginalBannerArrow,sizeof(kOriginalBannerArrow));
+        memcpy((void*)HOOK_BANNER_BORDER,kOriginalBannerBorder,sizeof(kOriginalBannerBorder));
         FlushInstructionCache(GetCurrentProcess(),NULL,0);
         if(g_caves!=NULL) VirtualFree(g_caves,0,MEM_RELEASE);
         g_caves=NULL;
         memset(g_units,0,sizeof(g_units));
         memset(g_entryToUnit,0,sizeof(g_entryToUnit));
         g_projectionWScratchBits = g_currentProjectionUnit = g_lastProjectionUnit = g_lastProjectionWBits = g_lastProjectionSource = g_projectionSequence = 0;
+        g_bannerSuppressScratch = 0;
         g_bannerToggleKeyWasDown = FALSE;
         g_hide256BannerForCalibration = FALSE;
+        g_loggedBannerSuppressHit = FALSE;
+        g_lastBannerToggleTick = 0;
         g_loaded=FALSE;
     }
 }
