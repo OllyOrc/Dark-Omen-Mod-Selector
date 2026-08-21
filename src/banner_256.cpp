@@ -6,7 +6,8 @@
 // branches of FUN_0043FC60 and capture the completed homogeneous W divisor
 // without disturbing the x87 stack. Projection capture is deliberately raw
 // and does not depend on class-256 having already been discovered; Hook B
-// associates the most recent projection sample with its exact current unit.
+// reports both matched and unmatched handoff state so we can distinguish
+// "hook never fired" from "capture fired but ESI is not the unit pointer".
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -34,9 +35,9 @@ namespace banner_256
     static const BYTE kOriginalRender[5] =
         { 0x57,0x55,0x8B,0x4E,0x04 };
     static const BYTE kOriginalProjectionE[6] =
-        { 0xD9,0x81,0x64,0x01,0x00,0x00 }; // fld dword ptr [ecx+164]
+        { 0xD9,0x81,0x64,0x01,0x00,0x00 };
     static const BYTE kOriginalProjectionF[6] =
-        { 0xD9,0xC9,0xDE,0xC2,0xD9,0xC9 }; // fxch ; faddp st(2),st(0) ; fxch
+        { 0xD9,0xC9,0xDE,0xC2,0xD9,0xC9 };
     static const BYTE kOriginalAnchor[7] =
         { 0xA1,0x14,0x37,0x50,0x00,0x2B,0xC2 };
 
@@ -54,6 +55,7 @@ namespace banner_256
         BOOL loggedHeight;
         BOOL loggedEdgeTerms;
         BOOL loggedRaise;
+        BOOL loggedProjectionStatus;
         DWORD projectionWBits;
         DWORD projectionSource;
         DWORD projectionSequence;
@@ -74,13 +76,10 @@ namespace banner_256
     static BYTE* g_caves = NULL;
     static BOOL g_loaded = FALSE;
 
-    // Hooks E/F use FST (not FSTP), then publish only raw integer state while
-    // FUN_0043FC60's x87 stack is live. No UNIT_STATE/class lookup happens in
-    // the projection routine, removing the old Hook-A-before-E ordering bug.
     static volatile DWORD g_projectionWScratchBits = 0;
     static volatile DWORD g_lastProjectionUnit = 0;
     static volatile DWORD g_lastProjectionWBits = 0;
-    static volatile DWORD g_lastProjectionSource = 0; // 1=E, 2=F
+    static volatile DWORD g_lastProjectionSource = 0;
     static volatile DWORD g_projectionSequence = 0;
 
     static void FlushTrace()
@@ -119,15 +118,12 @@ namespace banner_256
     static UNIT_STATE* FindOrCreateUnitState(DWORD unit)
     {
         if (unit == 0) return NULL;
-
         DWORD freeSlot = _countof(g_units);
         for (DWORD i = 0; i < _countof(g_units); ++i)
         {
             if (g_units[i].unit == unit) return &g_units[i];
-            if (freeSlot == _countof(g_units) && g_units[i].unit == 0)
-                freeSlot = i;
+            if (freeSlot == _countof(g_units) && g_units[i].unit == 0) freeSlot = i;
         }
-
         if (freeSlot >= _countof(g_units)) return NULL;
         memset(&g_units[freeSlot], 0, sizeof(g_units[freeSlot]));
         g_units[freeSlot].unit = unit;
@@ -137,46 +133,36 @@ namespace banner_256
     static void __cdecl MarkUnitClass(DWORD unit, DWORD templateEntry)
     {
         if (unit == 0 || templateEntry == 0) return;
-
         const DWORD width  = *((DWORD*)(templateEntry + 0x18));
         const DWORD height = *((DWORD*)(templateEntry + 0x1C));
         const BOOL is256 = (width == 256 && height == 256) ? TRUE : FALSE;
-
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state == NULL) return;
-
         if (is256)
         {
             state->is256 = TRUE;
             if (!state->loggedClass256)
             {
-                darkomen::detour::trace("Stage10 class256 detected unit=%08lX template=%08lX width=%lu height=%lu",
-                    unit, templateEntry, width, height);
-                FlushTrace();
-                state->loggedClass256 = TRUE;
+                darkomen::detour::trace("Stage10 class256 detected unit=%08lX template=%08lX width=%lu height=%lu", unit, templateEntry, width, height);
+                FlushTrace(); state->loggedClass256 = TRUE;
             }
             return;
         }
-
         if (state->is256)
         {
             if (!state->loggedSuppressedFalse)
             {
-                darkomen::detour::trace("Stage10 suppressed TRUE->FALSE unit=%08lX template=%08lX width=%lu height=%lu",
-                    unit, templateEntry, width, height);
-                FlushTrace();
-                state->loggedSuppressedFalse = TRUE;
+                darkomen::detour::trace("Stage10 suppressed TRUE->FALSE unit=%08lX template=%08lX width=%lu height=%lu", unit, templateEntry, width, height);
+                FlushTrace(); state->loggedSuppressedFalse = TRUE;
             }
             return;
         }
-
         state->is256 = FALSE;
     }
 
     static void __cdecl RecordEntryUnit(DWORD entry, DWORD unit)
     {
         if (entry == 0 || unit == 0) return;
-
         DWORD freeSlot = _countof(g_entryToUnit);
         for (DWORD i = 0; i < _countof(g_entryToUnit); ++i)
         {
@@ -187,15 +173,12 @@ namespace banner_256
                 if (state != NULL && state->is256 && !state->loggedEntry)
                 {
                     darkomen::detour::trace("Stage10 entryToUnit populated unit=%08lX entry=%08lX", unit, entry);
-                    FlushTrace();
-                    state->loggedEntry = TRUE;
+                    FlushTrace(); state->loggedEntry = TRUE;
                 }
                 return;
             }
-            if (freeSlot == _countof(g_entryToUnit) && g_entryToUnit[i].entry == 0)
-                freeSlot = i;
+            if (freeSlot == _countof(g_entryToUnit) && g_entryToUnit[i].entry == 0) freeSlot = i;
         }
-
         if (freeSlot < _countof(g_entryToUnit))
         {
             g_entryToUnit[freeSlot].entry = entry;
@@ -204,8 +187,7 @@ namespace banner_256
             if (state != NULL && state->is256 && !state->loggedEntry)
             {
                 darkomen::detour::trace("Stage10 entryToUnit populated unit=%08lX entry=%08lX", unit, entry);
-                FlushTrace();
-                state->loggedEntry = TRUE;
+                FlushTrace(); state->loggedEntry = TRUE;
             }
         }
     }
@@ -220,387 +202,231 @@ namespace banner_256
 
     static void __cdecl PublishProjectionSample(DWORD unit, DWORD source)
     {
-        // Integer-only while FUN_0043FC60's x87 stack is live.
         const DWORD bits = g_projectionWScratchBits;
-        if (unit == 0 || bits == 0) return;
-
+        if (bits == 0) return;
         g_lastProjectionUnit = unit;
         g_lastProjectionWBits = bits;
         g_lastProjectionSource = source;
         ++g_projectionSequence;
     }
 
-    static void __cdecl RecordProjectionWFromE(DWORD unit)
-    {
-        PublishProjectionSample(unit, 1);
-    }
-
-    static void __cdecl RecordProjectionWFromF(DWORD unit)
-    {
-        PublishProjectionSample(unit, 2);
-    }
+    static void __cdecl RecordProjectionWFromE(DWORD unit) { PublishProjectionSample(unit, 1); }
+    static void __cdecl RecordProjectionWFromF(DWORD unit) { PublishProjectionSample(unit, 2); }
 
     static void __cdecl CaptureRenderedHeight(DWORD entry)
     {
         const DWORD unit = FindUnitForEntry(entry);
         if (unit == 0 || entry == 0) return;
-
         const DWORD owner = *((DWORD*)entry);
         if (owner == 0) return;
-
         const DWORD frameBase = *((DWORD*)(owner + 0x10));
         if (frameBase == 0) return;
-
         const LONG frameIndex = *((LONG*)(entry + 0x04));
         if (frameIndex < 0 || frameIndex > 4096) return;
-
         const DWORD frameRecord = frameBase + ((DWORD)frameIndex * 0x2C);
         const float frameScale = *((float*)(frameRecord + 0x14));
         const float rawHeightField = *((float*)(frameRecord + 0x1C));
         const float resourceTerm = *((volatile float*)RENDER_HEIGHT_TERM);
         const float cameraUpY = *((volatile float*)CAMERA_UP_Y);
-
-        // Known-wrong correction retained only so this build is diagnostic-only.
         float renderedHeight = -resourceTerm * frameScale * cameraUpY;
         if (renderedHeight < 0.0f) renderedHeight = -renderedHeight;
-
         const float tHeight = rawHeightField * resourceTerm;
         const float fVar36 = -tHeight * frameScale;
         const float fVar37 = -(resourceTerm + tHeight) * frameScale;
-
         float edge36Y = fVar36 * cameraUpY;
         float edge37Y = fVar37 * cameraUpY;
         if (edge36Y < 0.0f) edge36Y = -edge36Y;
         if (edge37Y < 0.0f) edge37Y = -edge37Y;
-
         if (!(renderedHeight > 0.0f && renderedHeight < 4096.0f)) return;
-
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state != NULL)
         {
             state->renderedHeight = renderedHeight;
-
             if (state->is256 && !state->loggedHeight)
             {
-                darkomen::detour::trace("Stage10 renderedHeight unit=%08lX entry=%08lX h=%.3f frameScale=%.6f resource=%.6f upY=%.6f",
-                    unit, entry, renderedHeight, frameScale, resourceTerm, cameraUpY);
-                FlushTrace();
-                state->loggedHeight = TRUE;
+                darkomen::detour::trace("Stage10 renderedHeight unit=%08lX entry=%08lX h=%.3f frameScale=%.6f resource=%.6f upY=%.6f", unit, entry, renderedHeight, frameScale, resourceTerm, cameraUpY);
+                FlushTrace(); state->loggedHeight = TRUE;
             }
-
             if (state->is256 && !state->loggedEdgeTerms)
             {
                 const LONG anchor5 = *((LONG*)(entry + 0x14));
                 const LONG anchor6 = *((LONG*)(entry + 0x18));
                 const LONG anchor7 = *((LONG*)(entry + 0x1C));
-                darkomen::detour::trace("Stage10 edgeTerms unit=%08lX entry=%08lX rawH=%.6f T_h=%.6f f36=%.6f f37=%.6f edge36Y=%.6f edge37Y=%.6f p4[5..7]=%ld,%ld,%ld",
-                    unit, entry, rawHeightField, tHeight, fVar36, fVar37, edge36Y, edge37Y,
-                    anchor5, anchor6, anchor7);
-                FlushTrace();
-                state->loggedEdgeTerms = TRUE;
+                darkomen::detour::trace("Stage10 edgeTerms unit=%08lX entry=%08lX rawH=%.6f T_h=%.6f f36=%.6f f37=%.6f edge36Y=%.6f edge37Y=%.6f p4[5..7]=%ld,%ld,%ld", unit, entry, rawHeightField, tHeight, fVar36, fVar37, edge36Y, edge37Y, anchor5, anchor6, anchor7);
+                FlushTrace(); state->loggedEdgeTerms = TRUE;
             }
         }
     }
 
     static int __cdecl GetUnitAnchorRaise(DWORD unit)
     {
-        // Always create/find the unit state first.  This is intentional: Hook B
-        // can run before Hook A has classified this unit, and projection-W must
-        // not be discarded merely because that independent path has not run yet.
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state == NULL) return 0;
 
-        // Same-call raw handoff from Hook E/F. FUN_0043FC60 is reached from this
-        // computeUnitScreenBounds invocation immediately before Hook B, so an
-        // exact unit match associates the captured W without guessing ordering.
         const DWORD sequence = g_projectionSequence;
-        if (g_lastProjectionUnit == unit &&
-            g_lastProjectionWBits != 0 &&
-            sequence != state->projectionSequence)
+        const DWORD lastUnit = g_lastProjectionUnit;
+        const DWORD lastBits = g_lastProjectionWBits;
+        const DWORD lastSource = g_lastProjectionSource;
+
+        // Diagnostic status is intentionally logged once for a positively
+        // classified 256 unit even when the exact-unit association fails.
+        // This tells us whether E/F fired at all and what ESI contained there.
+        if (state->is256 && !state->loggedProjectionStatus)
         {
-            state->projectionWBits = g_lastProjectionWBits;
-            state->projectionSource = g_lastProjectionSource;
+            union FLOAT_BITS { DWORD bits; float value; } raw;
+            raw.bits = lastBits;
+            darkomen::detour::trace(
+                "Stage10 projectionStatus unit=%08lX seq=%lu capturedUnit=%08lX source=%c rawBits=%08lX rawW=%.6f match=%lu",
+                unit, sequence, lastUnit,
+                (lastSource == 2) ? 'F' : ((lastSource == 1) ? 'E' : '-'),
+                lastBits, raw.value, (lastUnit == unit) ? 1UL : 0UL);
+            FlushTrace();
+            state->loggedProjectionStatus = TRUE;
+        }
+
+        if (lastUnit == unit && lastBits != 0 && sequence != state->projectionSequence)
+        {
+            state->projectionWBits = lastBits;
+            state->projectionSource = lastSource;
             state->projectionSequence = sequence;
         }
 
-        // Only format/log floats after returning from FUN_0043FC60.  Once the
-        // unit is known to be 256, log the first sample and material W changes.
         if (state->is256 && state->projectionWBits != 0 &&
             state->projectionSequence != state->lastProjectionSequenceSeen &&
             state->projectionLogCount < 24)
         {
-            union FLOAT_BITS
-            {
-                DWORD bits;
-                float value;
-            } wBits;
+            union FLOAT_BITS { DWORD bits; float value; } wBits;
             wBits.bits = state->projectionWBits;
-
             const float w = wBits.value;
             const float absW = (w < 0.0f) ? -w : w;
             float delta = w - state->lastLoggedProjectionW;
             if (delta < 0.0f) delta = -delta;
-
             if (absW > 0.0001f && absW < 1000000.0f &&
                 (state->projectionLogCount == 0 || delta >= 0.25f))
             {
                 const LONG screenY = *((volatile LONG*)0x00503714);
-                darkomen::detour::trace(
-                    "Stage10 projectionW unit=%08lX W=%.6f screenY=%ld source=%c sample=%lu seq=%lu",
-                    unit, w, screenY,
-                    (state->projectionSource == 2) ? 'F' : 'E',
-                    state->projectionLogCount + 1, state->projectionSequence);
+                darkomen::detour::trace("Stage10 projectionW unit=%08lX W=%.6f screenY=%ld source=%c sample=%lu seq=%lu", unit, w, screenY, (state->projectionSource == 2) ? 'F' : 'E', state->projectionLogCount + 1, state->projectionSequence);
                 FlushTrace();
                 state->lastLoggedProjectionW = w;
                 ++state->projectionLogCount;
             }
-
             state->lastProjectionSequenceSeen = state->projectionSequence;
         }
 
         if (!state->is256) return 0;
-
         const float h = state->renderedHeight;
         if (!(h > 0.0f && h < 4096.0f)) return 0;
-
-        // Deliberately keep the existing known-wrong 1px-ish correction for
-        // this diagnostic build.  No visual formula change is being tested yet.
         const int raise = (int)(h * 0.25f + 0.5f);
         const int safeRaise = (raise > 0 && raise < 1024) ? raise : 0;
-
         if (safeRaise > 0 && !state->loggedRaise)
         {
             darkomen::detour::trace("Stage10 anchorRaise unit=%08lX h=%.3f raise=%d", unit, h, safeRaise);
-            FlushTrace();
-            state->loggedRaise = TRUE;
+            FlushTrace(); state->loggedRaise = TRUE;
         }
-
         return safeRaise;
     }
 
     static BOOL BuildCaves()
     {
         g_caves = (BYTE*)VirtualAlloc(NULL, 0x380, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-        if (g_caves == NULL)
-        {
-            Log("banner_256: VirtualAlloc failed (%lu)", GetLastError());
-            return FALSE;
-        }
+        if (g_caves == NULL) return FALSE;
 
-        BYTE* a = g_caves + 0x00;
-        DWORD n = 0;
+        BYTE* a = g_caves + 0x00; DWORD n = 0;
         a[n++] = 0x60;
         a[n++] = 0x8B; a[n++] = 0x44; a[n++] = 0x24; a[n++] = 0x30;
         a[n++] = 0x8B; a[n++] = 0x40; a[n++] = 0x1C;
-        a[n++] = 0x57;
-        a[n++] = 0x50;
-        DWORD callA = n;
-        a[n++] = 0xE8; n += 4;
-        a[n++] = 0x83; a[n++] = 0xC4; a[n++] = 0x08;
-        a[n++] = 0x61;
-        a[n++] = 0x8B; a[n++] = 0x6F; a[n++] = 0x48;
-        a[n++] = 0x85; a[n++] = 0xED;
-        DWORD jumpA = n;
-        a[n++] = 0xE9; n += 4;
-        WriteRel32(a + callA, (DWORD)&MarkUnitClass);
-        WriteRel32(a + jumpA, RETURN_CLASSIFY);
+        a[n++] = 0x57; a[n++] = 0x50;
+        DWORD callA = n; a[n++] = 0xE8; n += 4;
+        a[n++] = 0x83; a[n++] = 0xC4; a[n++] = 0x08; a[n++] = 0x61;
+        a[n++] = 0x8B; a[n++] = 0x6F; a[n++] = 0x48; a[n++] = 0x85; a[n++] = 0xED;
+        DWORD jumpA = n; a[n++] = 0xE9; n += 4;
+        WriteRel32(a + callA, (DWORD)&MarkUnitClass); WriteRel32(a + jumpA, RETURN_CLASSIFY);
 
-        BYTE* c = g_caves + 0x40;
-        n = 0;
-        c[n++] = 0xC7; c[n++] = 0x45; c[n++] = 0x10;
-        *((DWORD*)(c + n)) = 0; n += 4;
-        c[n++] = 0x9C;
-        c[n++] = 0x60;
+        BYTE* c = g_caves + 0x40; n = 0;
+        c[n++] = 0xC7; c[n++] = 0x45; c[n++] = 0x10; *((DWORD*)(c + n)) = 0; n += 4;
+        c[n++] = 0x9C; c[n++] = 0x60;
         c[n++] = 0x8B; c[n++] = 0x44; c[n++] = 0x24; c[n++] = 0x34;
-        c[n++] = 0x8B; c[n++] = 0x40; c[n++] = 0x1C;
-        c[n++] = 0x50;
-        c[n++] = 0x55;
-        DWORD callC = n;
-        c[n++] = 0xE8; n += 4;
-        c[n++] = 0x83; c[n++] = 0xC4; c[n++] = 0x08;
-        c[n++] = 0x61;
-        c[n++] = 0x9D;
-        DWORD jumpC = n;
-        c[n++] = 0xE9; n += 4;
-        WriteRel32(c + callC, (DWORD)&RecordEntryUnit);
-        WriteRel32(c + jumpC, RETURN_ENTRY);
+        c[n++] = 0x8B; c[n++] = 0x40; c[n++] = 0x1C; c[n++] = 0x50; c[n++] = 0x55;
+        DWORD callC = n; c[n++] = 0xE8; n += 4;
+        c[n++] = 0x83; c[n++] = 0xC4; c[n++] = 0x08; c[n++] = 0x61; c[n++] = 0x9D;
+        DWORD jumpC = n; c[n++] = 0xE9; n += 4;
+        WriteRel32(c + callC, (DWORD)&RecordEntryUnit); WriteRel32(c + jumpC, RETURN_ENTRY);
 
-        BYTE* d = g_caves + 0x80;
-        n = 0;
-        d[n++] = 0x57;
-        d[n++] = 0x55;
-        d[n++] = 0x8B; d[n++] = 0x4E; d[n++] = 0x04;
-        d[n++] = 0x9C;
-        d[n++] = 0x60;
-        d[n++] = 0x56;
-        DWORD callD = n;
-        d[n++] = 0xE8; n += 4;
-        d[n++] = 0x83; d[n++] = 0xC4; d[n++] = 0x04;
-        d[n++] = 0x61;
-        d[n++] = 0x9D;
-        DWORD jumpD = n;
-        d[n++] = 0xE9; n += 4;
-        WriteRel32(d + callD, (DWORD)&CaptureRenderedHeight);
-        WriteRel32(d + jumpD, RETURN_RENDER);
+        BYTE* d = g_caves + 0x80; n = 0;
+        d[n++] = 0x57; d[n++] = 0x55; d[n++] = 0x8B; d[n++] = 0x4E; d[n++] = 0x04;
+        d[n++] = 0x9C; d[n++] = 0x60; d[n++] = 0x56;
+        DWORD callD = n; d[n++] = 0xE8; n += 4;
+        d[n++] = 0x83; d[n++] = 0xC4; d[n++] = 0x04; d[n++] = 0x61; d[n++] = 0x9D;
+        DWORD jumpD = n; d[n++] = 0xE9; n += 4;
+        WriteRel32(d + callD, (DWORD)&CaptureRenderedHeight); WriteRel32(d + jumpD, RETURN_RENDER);
 
-        BYTE* b = g_caves + 0xC0;
-        n = 0;
-        b[n++] = 0xA1;
-        *((DWORD*)(b + n)) = 0x00503714; n += 4;
-        b[n++] = 0x2B; b[n++] = 0xC2;
-        b[n++] = 0x9C;
-        b[n++] = 0x51;
-        b[n++] = 0x52;
-        b[n++] = 0x50;
-        b[n++] = 0x56;
-        DWORD callB = n;
-        b[n++] = 0xE8; n += 4;
-        b[n++] = 0x83; b[n++] = 0xC4; b[n++] = 0x04;
-        b[n++] = 0x8B; b[n++] = 0xD0;
-        b[n++] = 0x58;
-        b[n++] = 0x2B; b[n++] = 0xC2;
-        b[n++] = 0x5A;
-        b[n++] = 0x59;
-        b[n++] = 0x9D;
-        DWORD jumpB = n;
-        b[n++] = 0xE9; n += 4;
-        WriteRel32(b + callB, (DWORD)&GetUnitAnchorRaise);
-        WriteRel32(b + jumpB, RETURN_ANCHOR);
+        BYTE* b = g_caves + 0xC0; n = 0;
+        b[n++] = 0xA1; *((DWORD*)(b + n)) = 0x00503714; n += 4; b[n++] = 0x2B; b[n++] = 0xC2;
+        b[n++] = 0x9C; b[n++] = 0x51; b[n++] = 0x52; b[n++] = 0x50; b[n++] = 0x56;
+        DWORD callB = n; b[n++] = 0xE8; n += 4;
+        b[n++] = 0x83; b[n++] = 0xC4; b[n++] = 0x04; b[n++] = 0x8B; b[n++] = 0xD0;
+        b[n++] = 0x58; b[n++] = 0x2B; b[n++] = 0xC2; b[n++] = 0x5A; b[n++] = 0x59; b[n++] = 0x9D;
+        DWORD jumpB = n; b[n++] = 0xE9; n += 4;
+        WriteRel32(b + callB, (DWORD)&GetUnitAnchorRaise); WriteRel32(b + jumpB, RETURN_ANCHOR);
 
-        BYTE* e = g_caves + 0x100;
-        n = 0;
-        // Hook E: ST0 contains completed W. Store without pop, recreate FLD.
-        e[n++] = 0xD9; e[n++] = 0x15;
-        *((DWORD*)(e + n)) = (DWORD)&g_projectionWScratchBits; n += 4;
-        e[n++] = 0xD9; e[n++] = 0x81;
-        e[n++] = 0x64; e[n++] = 0x01; e[n++] = 0x00; e[n++] = 0x00;
-        e[n++] = 0x9C;
-        e[n++] = 0x60;
-        e[n++] = 0x56;
-        DWORD callE = n;
-        e[n++] = 0xE8; n += 4;
-        e[n++] = 0x83; e[n++] = 0xC4; e[n++] = 0x04;
-        e[n++] = 0x61;
-        e[n++] = 0x9D;
-        DWORD jumpE = n;
-        e[n++] = 0xE9; n += 4;
-        WriteRel32(e + callE, (DWORD)&RecordProjectionWFromE);
-        WriteRel32(e + jumpE, RETURN_PROJECTION_E);
+        BYTE* e = g_caves + 0x100; n = 0;
+        e[n++] = 0xD9; e[n++] = 0x15; *((DWORD*)(e + n)) = (DWORD)&g_projectionWScratchBits; n += 4;
+        e[n++] = 0xD9; e[n++] = 0x81; e[n++] = 0x64; e[n++] = 0x01; e[n++] = 0x00; e[n++] = 0x00;
+        e[n++] = 0x9C; e[n++] = 0x60; e[n++] = 0x56;
+        DWORD callE = n; e[n++] = 0xE8; n += 4;
+        e[n++] = 0x83; e[n++] = 0xC4; e[n++] = 0x04; e[n++] = 0x61; e[n++] = 0x9D;
+        DWORD jumpE = n; e[n++] = 0xE9; n += 4;
+        WriteRel32(e + callE, (DWORD)&RecordProjectionWFromE); WriteRel32(e + jumpE, RETURN_PROJECTION_E);
 
-        BYTE* f = g_caves + 0x140;
-        n = 0;
-        // Hook F: non-billboard branch. ST0 contains completed W immediately
-        // before FXCH; store without pop, then replay FXCH/FADDP/FXCH.
-        f[n++] = 0xD9; f[n++] = 0x15;
-        *((DWORD*)(f + n)) = (DWORD)&g_projectionWScratchBits; n += 4;
-        f[n++] = 0xD9; f[n++] = 0xC9;
-        f[n++] = 0xDE; f[n++] = 0xC2;
-        f[n++] = 0xD9; f[n++] = 0xC9;
-        f[n++] = 0x9C;
-        f[n++] = 0x60;
-        f[n++] = 0x56;
-        DWORD callF = n;
-        f[n++] = 0xE8; n += 4;
-        f[n++] = 0x83; f[n++] = 0xC4; f[n++] = 0x04;
-        f[n++] = 0x61;
-        f[n++] = 0x9D;
-        DWORD jumpF = n;
-        f[n++] = 0xE9; n += 4;
-        WriteRel32(f + callF, (DWORD)&RecordProjectionWFromF);
-        WriteRel32(f + jumpF, RETURN_PROJECTION_F);
+        BYTE* f = g_caves + 0x140; n = 0;
+        f[n++] = 0xD9; f[n++] = 0x15; *((DWORD*)(f + n)) = (DWORD)&g_projectionWScratchBits; n += 4;
+        f[n++] = 0xD9; f[n++] = 0xC9; f[n++] = 0xDE; f[n++] = 0xC2; f[n++] = 0xD9; f[n++] = 0xC9;
+        f[n++] = 0x9C; f[n++] = 0x60; f[n++] = 0x56;
+        DWORD callF = n; f[n++] = 0xE8; n += 4;
+        f[n++] = 0x83; f[n++] = 0xC4; f[n++] = 0x04; f[n++] = 0x61; f[n++] = 0x9D;
+        DWORD jumpF = n; f[n++] = 0xE9; n += 4;
+        WriteRel32(f + callF, (DWORD)&RecordProjectionWFromF); WriteRel32(f + jumpF, RETURN_PROJECTION_F);
 
-        FlushInstructionCache(GetCurrentProcess(), g_caves, 0x380);
-        return TRUE;
+        FlushInstructionCache(GetCurrentProcess(), g_caves, 0x380); return TRUE;
     }
 
     void Load()
     {
         if (g_loaded) return;
-
-        if (!BytesEqual(HOOK_CLASSIFY, kOriginalClassify, sizeof(kOriginalClassify)))
+        if (!BytesEqual(HOOK_CLASSIFY,kOriginalClassify,sizeof(kOriginalClassify)) ||
+            !BytesEqual(HOOK_ENTRY,kOriginalEntry,sizeof(kOriginalEntry)) ||
+            !BytesEqual(HOOK_RENDER,kOriginalRender,sizeof(kOriginalRender)) ||
+            !BytesEqual(HOOK_PROJECTION_E,kOriginalProjectionE,sizeof(kOriginalProjectionE)) ||
+            !BytesEqual(HOOK_PROJECTION_F,kOriginalProjectionF,sizeof(kOriginalProjectionF)) ||
+            !BytesEqual(HOOK_ANCHOR,kOriginalAnchor,sizeof(kOriginalAnchor)))
         {
-            Log("banner_256: EngRel mismatch at 0x0042B84F; Stage10 not installed");
-            darkomen::detour::trace("Stage10 install FAIL byte-guard 0x0042B84F"); FlushTrace();
-            return;
+            darkomen::detour::trace("Stage10 install FAIL byte guard"); FlushTrace(); return;
         }
-        if (!BytesEqual(HOOK_ENTRY, kOriginalEntry, sizeof(kOriginalEntry)))
-        {
-            Log("banner_256: EngRel mismatch at 0x0042B97F; Stage10 not installed");
-            darkomen::detour::trace("Stage10 install FAIL byte-guard 0x0042B97F"); FlushTrace();
-            return;
-        }
-        if (!BytesEqual(HOOK_RENDER, kOriginalRender, sizeof(kOriginalRender)))
-        {
-            Log("banner_256: EngRel mismatch at 0x00442B49; Stage10 not installed");
-            darkomen::detour::trace("Stage10 install FAIL byte-guard 0x00442B49"); FlushTrace();
-            return;
-        }
-        if (!BytesEqual(HOOK_PROJECTION_E, kOriginalProjectionE, sizeof(kOriginalProjectionE)))
-        {
-            Log("banner_256: EngRel mismatch at 0x0043FD2C; Stage10 not installed");
-            darkomen::detour::trace("Stage10 install FAIL byte-guard 0x0043FD2C"); FlushTrace();
-            return;
-        }
-        if (!BytesEqual(HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjectionF)))
-        {
-            Log("banner_256: EngRel mismatch at 0x0043FE24; Stage10 not installed");
-            darkomen::detour::trace("Stage10 install FAIL byte-guard 0x0043FE24"); FlushTrace();
-            return;
-        }
-        if (!BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)))
-        {
-            Log("banner_256: EngRel mismatch at 0x004504B8; Stage10 not installed");
-            darkomen::detour::trace("Stage10 install FAIL byte-guard 0x004504B8"); FlushTrace();
-            return;
-        }
-
-        memset(g_units, 0, sizeof(g_units));
-        memset(g_entryToUnit, 0, sizeof(g_entryToUnit));
-        g_projectionWScratchBits = 0;
-        g_lastProjectionUnit = 0;
-        g_lastProjectionWBits = 0;
-        g_lastProjectionSource = 0;
-        g_projectionSequence = 0;
-
+        memset(g_units,0,sizeof(g_units)); memset(g_entryToUnit,0,sizeof(g_entryToUnit));
+        g_projectionWScratchBits = g_lastProjectionUnit = g_lastProjectionWBits = g_lastProjectionSource = g_projectionSequence = 0;
         if (!BuildCaves()) return;
-
-        WriteJump(HOOK_CLASSIFY,      (DWORD)(g_caves + 0x00), 5);
-        WriteJump(HOOK_ENTRY,         (DWORD)(g_caves + 0x40), 7);
-        WriteJump(HOOK_RENDER,        (DWORD)(g_caves + 0x80), 5);
-        WriteJump(HOOK_ANCHOR,        (DWORD)(g_caves + 0xC0), 7);
-        WriteJump(HOOK_PROJECTION_E,  (DWORD)(g_caves + 0x100), 6);
-        WriteJump(HOOK_PROJECTION_F,  (DWORD)(g_caves + 0x140), 6);
-        FlushInstructionCache(GetCurrentProcess(), NULL, 0);
-
-        g_loaded = TRUE;
-        Log("banner_256: Stage10 dual-branch projection-W diagnostic installed");
-        darkomen::detour::trace("Stage10 installed: dual-branch projection-W diagnostic active; correction unchanged");
-        FlushTrace();
+        WriteJump(HOOK_CLASSIFY,(DWORD)(g_caves+0x00),5);
+        WriteJump(HOOK_ENTRY,(DWORD)(g_caves+0x40),7);
+        WriteJump(HOOK_RENDER,(DWORD)(g_caves+0x80),5);
+        WriteJump(HOOK_PROJECTION_E,(DWORD)(g_caves+0x100),6);
+        WriteJump(HOOK_PROJECTION_F,(DWORD)(g_caves+0x140),6);
+        WriteJump(HOOK_ANCHOR,(DWORD)(g_caves+0xC0),7);
+        FlushInstructionCache(GetCurrentProcess(),NULL,0);
+        g_loaded=TRUE;
+        darkomen::detour::trace("Stage10 installed: raw projection handoff diagnostic active; correction unchanged"); FlushTrace();
     }
 
     void Unload()
     {
         if (!g_loaded) return;
-
-        memcpy((void*)HOOK_CLASSIFY, kOriginalClassify, sizeof(kOriginalClassify));
-        memcpy((void*)HOOK_ENTRY, kOriginalEntry, sizeof(kOriginalEntry));
-        memcpy((void*)HOOK_RENDER, kOriginalRender, sizeof(kOriginalRender));
-        memcpy((void*)HOOK_PROJECTION_E, kOriginalProjectionE, sizeof(kOriginalProjectionE));
-        memcpy((void*)HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjectionF));
-        memcpy((void*)HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor));
-        FlushInstructionCache(GetCurrentProcess(), NULL, 0);
-
-        if (g_caves != NULL)
-            VirtualFree(g_caves, 0, MEM_RELEASE);
-
-        g_caves = NULL;
-        memset(g_units, 0, sizeof(g_units));
-        memset(g_entryToUnit, 0, sizeof(g_entryToUnit));
-        g_projectionWScratchBits = 0;
-        g_lastProjectionUnit = 0;
-        g_lastProjectionWBits = 0;
-        g_lastProjectionSource = 0;
-        g_projectionSequence = 0;
-        g_loaded = FALSE;
+        memcpy((void*)HOOK_CLASSIFY,kOriginalClassify,sizeof(kOriginalClassify));
+        memcpy((void*)HOOK_ENTRY,kOriginalEntry,sizeof(kOriginalEntry));
+        memcpy((void*)HOOK_RENDER,kOriginalRender,sizeof(kOriginalRender));
+        memcpy((void*)HOOK_PROJECTION_E,kOriginalProjectionE,sizeof(kOriginalProjectionE));
+        memcpy((void*)HOOK_PROJECTION_F,kOriginalProjectionF,sizeof(kOriginalProjectionF));
+        memcpy((void*)HOOK_ANCHOR,kOriginalAnchor,sizeof(kOriginalAnchor));
+        FlushInstructionCache(GetCurrentProcess(),NULL,0);
+        if(g_caves!=NULL) VirtualFree(g_caves,0,MEM_RELEASE);
+        g_caves=NULL; memset(g_units,0,sizeof(g_units)); memset(g_entryToUnit,0,sizeof(g_entryToUnit)); g_loaded=FALSE;
     }
 }
