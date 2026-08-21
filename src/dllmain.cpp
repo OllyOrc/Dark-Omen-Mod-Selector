@@ -47,6 +47,11 @@ void applyHooks()
 	// expected EngRel bytes before applying anything.
 	sprite_256::Load();
 
+	// Stage9C depends on the sixth resource class above.  It leaves all original
+	// classes unchanged and raises the shared overlay/interaction Y anchor only
+	// for units whose current body sprite resolves to the 256x256 class.
+	banner_256::Load();
+
 	darkomen::modmenu::applyHooks();
 	
 	dgvoodoo::Load();
