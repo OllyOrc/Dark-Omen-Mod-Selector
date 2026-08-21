@@ -40,15 +40,14 @@ namespace banner_256
     static const DWORD RETURN_ANCHOR   = 0x004504BF;
 
     static const BYTE kOriginalClassify[5] =
-        { 0x8B,0x6F,0x48,0x85,0xED }; // mov ebp,[edi+48] ; test ebp,ebp
+        { 0x8B,0x6F,0x48,0x85,0xED };
     static const BYTE kOriginalEntry[7] =
-        { 0xC7,0x45,0x10,0x00,0x00,0x00,0x00 }; // mov dword ptr [ebp+10],0
+        { 0xC7,0x45,0x10,0x00,0x00,0x00,0x00 };
     static const BYTE kOriginalRender[5] =
-        { 0x57,0x55,0x8B,0x4E,0x04 }; // push edi ; push ebp ; mov ecx,[esi+04]
+        { 0x57,0x55,0x8B,0x4E,0x04 };
     static const BYTE kOriginalAnchor[7] =
-        { 0xA1,0x14,0x37,0x50,0x00,0x2B,0xC2 }; // mov eax,[00503714] ; sub eax,edx
+        { 0xA1,0x14,0x37,0x50,0x00,0x2B,0xC2 };
 
-    // Live renderer terms used by FUN_00442B40's vertex-Y calculation.
     static const DWORD RENDER_HEIGHT_TERM = 0x00502B6C;
     static const DWORD CAMERA_UP_Y        = 0x00502B84;
 
@@ -61,6 +60,7 @@ namespace banner_256
         BOOL loggedSuppressedFalse;
         BOOL loggedEntry;
         BOOL loggedHeight;
+        BOOL loggedEdgeTerms;
         BOOL loggedRaise;
     };
 
@@ -70,7 +70,6 @@ namespace banner_256
         DWORD unit;
     };
 
-    // Dark Omen's battle-side structures are capped at 400 entries elsewhere.
     static UNIT_STATE g_units[400];
     static ENTRY_UNIT_LINK g_entryToUnit[400];
 
@@ -105,12 +104,8 @@ namespace banner_256
     static UNIT_STATE* FindUnitState(DWORD unit)
     {
         if (unit == 0) return NULL;
-
         for (DWORD i = 0; i < _countof(g_units); ++i)
-        {
-            if (g_units[i].unit == unit)
-                return &g_units[i];
-        }
+            if (g_units[i].unit == unit) return &g_units[i];
         return NULL;
     }
 
@@ -121,14 +116,12 @@ namespace banner_256
         DWORD freeSlot = _countof(g_units);
         for (DWORD i = 0; i < _countof(g_units); ++i)
         {
-            if (g_units[i].unit == unit)
-                return &g_units[i];
+            if (g_units[i].unit == unit) return &g_units[i];
             if (freeSlot == _countof(g_units) && g_units[i].unit == 0)
                 freeSlot = i;
         }
 
         if (freeSlot >= _countof(g_units)) return NULL;
-
         memset(&g_units[freeSlot], 0, sizeof(g_units[freeSlot]));
         g_units[freeSlot].unit = unit;
         return &g_units[freeSlot];
@@ -147,10 +140,6 @@ namespace banner_256
 
         if (is256)
         {
-            // Stage9C could silently lose TRUE if the same unit later passed
-            // Hook A for another ordinary-sized render resource.  For this
-            // diagnostic build, TRUE is sticky for the unit once positively
-            // proven by a 256x256 template.
             state->is256 = TRUE;
             if (!state->loggedClass256)
             {
@@ -204,7 +193,6 @@ namespace banner_256
         {
             g_entryToUnit[freeSlot].entry = entry;
             g_entryToUnit[freeSlot].unit = unit;
-
             UNIT_STATE* state = FindUnitState(unit);
             if (state != NULL && state->is256 && !state->loggedEntry)
             {
@@ -218,12 +206,8 @@ namespace banner_256
     static DWORD FindUnitForEntry(DWORD entry)
     {
         if (entry == 0) return 0;
-
         for (DWORD i = 0; i < _countof(g_entryToUnit); ++i)
-        {
-            if (g_entryToUnit[i].entry == entry)
-                return g_entryToUnit[i].unit;
-        }
+            if (g_entryToUnit[i].entry == entry) return g_entryToUnit[i].unit;
         return 0;
     }
 
@@ -232,10 +216,6 @@ namespace banner_256
         const DWORD unit = FindUnitForEntry(entry);
         if (unit == 0 || entry == 0) return;
 
-        // FUN_00442B40 computes the current animation frame record as:
-        //   frameRecord = *(DWORD*)(*(DWORD*)entry + 0x10)
-        //               + *(int*)(entry + 0x04) * 0x2C
-        // and reads fVar28 from frameRecord+0x14.
         const DWORD owner = *((DWORD*)entry);
         if (owner == 0) return;
 
@@ -247,28 +227,49 @@ namespace banner_256
 
         const DWORD frameRecord = frameBase + ((DWORD)frameIndex * 0x2C);
         const float frameScale = *((float*)(frameRecord + 0x14));
+        const float rawHeightField = *((float*)(frameRecord + 0x1C));
         const float resourceTerm = *((volatile float*)RENDER_HEIGHT_TERM);
         const float cameraUpY = *((volatile float*)CAMERA_UP_Y);
 
+        // Keep the current known-wrong Stage10 correction unchanged for this
+        // diagnostic build.  We only add measurements for the full edge terms.
         float renderedHeight = -resourceTerm * frameScale * cameraUpY;
-        if (renderedHeight < 0.0f)
-            renderedHeight = -renderedHeight;
+        if (renderedHeight < 0.0f) renderedHeight = -renderedHeight;
 
-        // Reject zero, NaN and obviously nonsensical values without touching the
-        // last known-good height.  NaN fails both ordered comparisons below.
-        if (!(renderedHeight > 0.0f && renderedHeight < 4096.0f))
-            return;
+        const float tHeight = rawHeightField * resourceTerm;
+        const float fVar36 = -tHeight * frameScale;
+        const float fVar37 = -(resourceTerm + tHeight) * frameScale;
+
+        float edge36Y = fVar36 * cameraUpY;
+        float edge37Y = fVar37 * cameraUpY;
+        if (edge36Y < 0.0f) edge36Y = -edge36Y;
+        if (edge37Y < 0.0f) edge37Y = -edge37Y;
+
+        if (!(renderedHeight > 0.0f && renderedHeight < 4096.0f)) return;
 
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state != NULL)
         {
             state->renderedHeight = renderedHeight;
+
             if (state->is256 && !state->loggedHeight)
             {
                 darkomen::detour::trace("Stage10 renderedHeight unit=%08lX entry=%08lX h=%.3f frameScale=%.6f resource=%.6f upY=%.6f",
                     unit, entry, renderedHeight, frameScale, resourceTerm, cameraUpY);
                 FlushTrace();
                 state->loggedHeight = TRUE;
+            }
+
+            if (state->is256 && !state->loggedEdgeTerms)
+            {
+                const LONG anchor5 = *((LONG*)(entry + 0x14));
+                const LONG anchor6 = *((LONG*)(entry + 0x18));
+                const LONG anchor7 = *((LONG*)(entry + 0x1C));
+                darkomen::detour::trace("Stage10 edgeTerms unit=%08lX entry=%08lX rawH=%.6f T_h=%.6f f36=%.6f f37=%.6f edge36Y=%.6f edge37Y=%.6f p4[5..7]=%ld,%ld,%ld",
+                    unit, entry, rawHeightField, tHeight, fVar36, fVar37, edge36Y, edge37Y,
+                    anchor5, anchor6, anchor7);
+                FlushTrace();
+                state->loggedEdgeTerms = TRUE;
             }
         }
     }
@@ -281,9 +282,6 @@ namespace banner_256
         const float h = state->renderedHeight;
         if (!(h > 0.0f && h < 4096.0f)) return 0;
 
-        // 256 full height has 64 native pixels of extra centre-to-top extent
-        // compared with 128: 64/256 == 0.25.  h is positive, so +0.5 gives a
-        // stable nearest-pixel integer before Hook B subtracts it from anchorY.
         const int raise = (int)(h * 0.25f + 0.5f);
         const int safeRaise = (raise > 0 && raise < 1024) ? raise : 0;
 
@@ -299,7 +297,6 @@ namespace banner_256
 
     static BOOL BuildCaves()
     {
-        // Four compact x86 trampolines, kept well separated for readability.
         g_caves = (BYTE*)VirtualAlloc(NULL, 0x200, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (g_caves == NULL)
         {
@@ -310,99 +307,81 @@ namespace banner_256
         BYTE* a = g_caves + 0x00;
         DWORD n = 0;
 
-        // Hook A, entered at 0x0042B84F.
-        // pushad changes ESP by 0x20, so original [esp+0x10] becomes [esp+0x30].
-        a[n++] = 0x60;                                      // pushad
-        a[n++] = 0x8B; a[n++] = 0x44; a[n++] = 0x24; a[n++] = 0x30; // mov eax,[esp+30]
-        a[n++] = 0x8B; a[n++] = 0x40; a[n++] = 0x1C;       // mov eax,[eax+1C] (unit)
-        a[n++] = 0x57;                                      // push edi (template entry)
-        a[n++] = 0x50;                                      // push eax (unit)
+        a[n++] = 0x60;
+        a[n++] = 0x8B; a[n++] = 0x44; a[n++] = 0x24; a[n++] = 0x30;
+        a[n++] = 0x8B; a[n++] = 0x40; a[n++] = 0x1C;
+        a[n++] = 0x57;
+        a[n++] = 0x50;
         DWORD callA = n;
-        a[n++] = 0xE8; n += 4;                              // call MarkUnitClass
-        a[n++] = 0x83; a[n++] = 0xC4; a[n++] = 0x08;       // add esp,8
-        a[n++] = 0x61;                                      // popad
-        a[n++] = 0x8B; a[n++] = 0x6F; a[n++] = 0x48;       // mov ebp,[edi+48]
-        a[n++] = 0x85; a[n++] = 0xED;                       // test ebp,ebp
+        a[n++] = 0xE8; n += 4;
+        a[n++] = 0x83; a[n++] = 0xC4; a[n++] = 0x08;
+        a[n++] = 0x61;
+        a[n++] = 0x8B; a[n++] = 0x6F; a[n++] = 0x48;
+        a[n++] = 0x85; a[n++] = 0xED;
         DWORD jumpA = n;
-        a[n++] = 0xE9; n += 4;                              // jmp 0042B854
-
+        a[n++] = 0xE9; n += 4;
         WriteRel32(a + callA, (DWORD)&MarkUnitClass);
         WriteRel32(a + jumpA, RETURN_CLASSIFY);
 
         BYTE* c = g_caves + 0x40;
         n = 0;
-
-        // Hook C, entered at 0x0042B97F.
-        // Recreate MOV [EBP+10],0 before preserving state. pushfd+pushad then
-        // shift the original stack by 0x24, so original [ESP+10] is [ESP+34].
         c[n++] = 0xC7; c[n++] = 0x45; c[n++] = 0x10;
-        *((DWORD*)(c + n)) = 0; n += 4;                     // mov dword ptr [ebp+10],0
-        c[n++] = 0x9C;                                      // pushfd
-        c[n++] = 0x60;                                      // pushad
-        c[n++] = 0x8B; c[n++] = 0x44; c[n++] = 0x24; c[n++] = 0x34; // mov eax,[esp+34]
-        c[n++] = 0x8B; c[n++] = 0x40; c[n++] = 0x1C;       // mov eax,[eax+1C] (unit)
-        c[n++] = 0x50;                                      // push eax (unit)
-        c[n++] = 0x55;                                      // push ebp (entry)
+        *((DWORD*)(c + n)) = 0; n += 4;
+        c[n++] = 0x9C;
+        c[n++] = 0x60;
+        c[n++] = 0x8B; c[n++] = 0x44; c[n++] = 0x24; c[n++] = 0x34;
+        c[n++] = 0x8B; c[n++] = 0x40; c[n++] = 0x1C;
+        c[n++] = 0x50;
+        c[n++] = 0x55;
         DWORD callC = n;
-        c[n++] = 0xE8; n += 4;                              // call RecordEntryUnit
-        c[n++] = 0x83; c[n++] = 0xC4; c[n++] = 0x08;       // add esp,8
-        c[n++] = 0x61;                                      // popad
-        c[n++] = 0x9D;                                      // popfd
+        c[n++] = 0xE8; n += 4;
+        c[n++] = 0x83; c[n++] = 0xC4; c[n++] = 0x08;
+        c[n++] = 0x61;
+        c[n++] = 0x9D;
         DWORD jumpC = n;
-        c[n++] = 0xE9; n += 4;                              // jmp 0042B986
-
+        c[n++] = 0xE9; n += 4;
         WriteRel32(c + callC, (DWORD)&RecordEntryUnit);
         WriteRel32(c + jumpC, RETURN_ENTRY);
 
         BYTE* d = g_caves + 0x80;
         n = 0;
-
-        // Hook D, entered at 0x00442B49 after ESI=param_4 has already loaded.
-        // The first two pushes belong to the game's real stack frame and must
-        // remain in place when we return to 0x00442B4E.
-        d[n++] = 0x57;                                      // push edi
-        d[n++] = 0x55;                                      // push ebp
-        d[n++] = 0x8B; d[n++] = 0x4E; d[n++] = 0x04;       // mov ecx,[esi+04]
-        d[n++] = 0x9C;                                      // pushfd
-        d[n++] = 0x60;                                      // pushad
-        d[n++] = 0x56;                                      // push esi (entry)
+        d[n++] = 0x57;
+        d[n++] = 0x55;
+        d[n++] = 0x8B; d[n++] = 0x4E; d[n++] = 0x04;
+        d[n++] = 0x9C;
+        d[n++] = 0x60;
+        d[n++] = 0x56;
         DWORD callD = n;
-        d[n++] = 0xE8; n += 4;                              // call CaptureRenderedHeight
-        d[n++] = 0x83; d[n++] = 0xC4; d[n++] = 0x04;       // add esp,4
-        d[n++] = 0x61;                                      // popad
-        d[n++] = 0x9D;                                      // popfd
+        d[n++] = 0xE8; n += 4;
+        d[n++] = 0x83; d[n++] = 0xC4; d[n++] = 0x04;
+        d[n++] = 0x61;
+        d[n++] = 0x9D;
         DWORD jumpD = n;
-        d[n++] = 0xE9; n += 4;                              // jmp 00442B4E
-
+        d[n++] = 0xE9; n += 4;
         WriteRel32(d + callD, (DWORD)&CaptureRenderedHeight);
         WriteRel32(d + jumpD, RETURN_RENDER);
 
         BYTE* b = g_caves + 0xC0;
         n = 0;
-
-        // Hook B, entered at 0x004504B8. ESI is the current unit pointer.
-        // Recreate the displaced vanilla Y calculation first and preserve its
-        // flags.  The helper returns a positive number of pixels to raise.
-        b[n++] = 0xA1;                                      // mov eax,[00503714]
+        b[n++] = 0xA1;
         *((DWORD*)(b + n)) = 0x00503714; n += 4;
-        b[n++] = 0x2B; b[n++] = 0xC2;                       // sub eax,edx
-        b[n++] = 0x9C;                                      // pushfd (vanilla flags)
-        b[n++] = 0x51;                                      // push ecx
-        b[n++] = 0x52;                                      // push edx
-        b[n++] = 0x50;                                      // push eax (saved vanilla Y)
-        b[n++] = 0x56;                                      // push esi (unit argument)
+        b[n++] = 0x2B; b[n++] = 0xC2;
+        b[n++] = 0x9C;
+        b[n++] = 0x51;
+        b[n++] = 0x52;
+        b[n++] = 0x50;
+        b[n++] = 0x56;
         DWORD callB = n;
-        b[n++] = 0xE8; n += 4;                              // call GetUnitAnchorRaise
-        b[n++] = 0x83; b[n++] = 0xC4; b[n++] = 0x04;       // add esp,4
-        b[n++] = 0x8B; b[n++] = 0xD0;                       // mov edx,eax (raise)
-        b[n++] = 0x58;                                      // pop eax (vanilla Y)
-        b[n++] = 0x2B; b[n++] = 0xC2;                       // sub eax,edx
-        b[n++] = 0x5A;                                      // pop edx
-        b[n++] = 0x59;                                      // pop ecx
-        b[n++] = 0x9D;                                      // popfd (restore vanilla flags)
+        b[n++] = 0xE8; n += 4;
+        b[n++] = 0x83; b[n++] = 0xC4; b[n++] = 0x04;
+        b[n++] = 0x8B; b[n++] = 0xD0;
+        b[n++] = 0x58;
+        b[n++] = 0x2B; b[n++] = 0xC2;
+        b[n++] = 0x5A;
+        b[n++] = 0x59;
+        b[n++] = 0x9D;
         DWORD jumpB = n;
-        b[n++] = 0xE9; n += 4;                              // jmp 004504BF
-
+        b[n++] = 0xE9; n += 4;
         WriteRel32(b + callB, (DWORD)&GetUnitAnchorRaise);
         WriteRel32(b + jumpB, RETURN_ANCHOR);
 
@@ -451,8 +430,8 @@ namespace banner_256
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
 
         g_loaded = TRUE;
-        Log("banner_256: Stage10 diagnostic installed; sticky class256 and rendered-height Y correction active");
-        darkomen::detour::trace("Stage10 installed: sticky class256 + diagnostic trace active");
+        Log("banner_256: Stage10 edge-term diagnostic installed");
+        darkomen::detour::trace("Stage10 installed: edge-term diagnostic active; correction unchanged");
         FlushTrace();
     }
 
