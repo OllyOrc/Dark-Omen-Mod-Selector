@@ -1,17 +1,10 @@
-// Stage10 diagnostic: keep vanilla overlay / interaction placement for the
-// original resource classes while investigating a zoom-aware correction for
-// the new 256x256 body class.
-//
-// Hooks A/C/D/B are the existing Stage10 path. Hooks E and F cover both
-// branches of FUN_0043FC60 and capture the completed homogeneous W divisor
-// without disturbing the x87 stack. Hook G runs at the proven owner site in
-// computeUnitScreenBounds immediately before CALL 0x00427C30, where ESI is
-// still the true unit pointer, and publishes that pointer for E/F to associate
-// with the nested projection sample. The stable-W sampler records valid W at a
-// low fixed time cadence even when the camera is stationary. F11 temporarily
-// toggles the game's DisplayOverlays flag so a calibration screenshot can show
-// the unobstructed 256x256 body at exactly the same camera position. No visual
-// anchor formula change is made here.
+// Stage10: keep vanilla overlay / interaction placement for the original
+// resource classes, while applying a zoom-aware anchor correction only to the
+// new 256x256 body class. Hooks E/F/G capture and associate the homogeneous W
+// divisor with the true live unit. Hook B then raises the shared overlay /
+// interaction anchor by round(K / |W|), with K initially calibrated to 1080.
+// F11 retains the DisplayOverlays calibration toggle for convenient visual
+// validation. Original sprite classes remain unchanged.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -54,6 +47,7 @@ namespace banner_256
     static const DWORD RENDER_HEIGHT_TERM = 0x00502B6C;
     static const DWORD CAMERA_UP_Y        = 0x00502B84;
     static const DWORD DISPLAY_OVERLAYS    = 0x004BF0F0;
+    static const float ANCHOR_K_256        = 1080.0f;
 
     struct UNIT_STATE
     {
@@ -349,13 +343,19 @@ namespace banner_256
         }
 
         if (!state->is256) return 0;
-        const float h = state->renderedHeight;
-        if (!(h > 0.0f && h < 4096.0f)) return 0;
-        const int raise = (int)(h * 0.25f + 0.5f);
+        if (state->projectionWBits == 0) return 0;
+
+        union FLOAT_BITS { DWORD bits; float value; } wBits;
+        wBits.bits = state->projectionWBits;
+        const float w = wBits.value;
+        const float absW = (w < 0.0f) ? -w : w;
+        if (!(absW > 0.0001f && absW < 1000000.0f)) return 0;
+
+        const int raise = (int)((ANCHOR_K_256 / absW) + 0.5f);
         const int safeRaise = (raise > 0 && raise < 1024) ? raise : 0;
         if (safeRaise > 0 && !state->loggedRaise)
         {
-            darkomen::detour::trace("Stage10 anchorRaise unit=%08lX h=%.3f raise=%d", unit, h, safeRaise);
+            darkomen::detour::trace("Stage10 anchorRaiseK unit=%08lX W=%.6f K=%.1f raise=%d", unit, w, ANCHOR_K_256, safeRaise);
             FlushTrace(); state->loggedRaise = TRUE;
         }
         return safeRaise;
@@ -463,7 +463,7 @@ namespace banner_256
         WriteJump(HOOK_ANCHOR,(DWORD)(g_caves+0xC0),7);
         FlushInstructionCache(GetCurrentProcess(),NULL,0);
         g_loaded=TRUE;
-        darkomen::detour::trace("Stage10 installed: Hook-G stableW + F11 overlay calibration diagnostic active; correction unchanged");
+        darkomen::detour::trace("Stage10 installed: Hook-G stableW + K=1080 zoom-aware 256 anchor correction active; F11 DisplayOverlays diagnostic retained");
         darkomen::detour::trace("Stage10 overlayCalibration initial DisplayOverlays=%lu; press F11 to toggle", g_originalDisplayOverlays);
         FlushTrace();
     }
