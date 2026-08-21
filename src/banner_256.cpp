@@ -4,29 +4,33 @@
 //
 // Hooks A/C/D/B are the existing Stage10 path. Hooks E and F cover both
 // branches of FUN_0043FC60 and capture the completed homogeneous W divisor
-// without disturbing the x87 stack. Projection capture is deliberately raw
-// and does not depend on class-256 having already been discovered; Hook B
-// reports both matched and unmatched handoff state so we can distinguish
-// "hook never fired" from "capture fired but ESI is not the unit pointer".
+// without disturbing the x87 stack. Hook G runs at the proven owner site in
+// computeUnitScreenBounds immediately before CALL 0x00427C30, where ESI is
+// still the true unit pointer, and publishes that pointer for E/F to associate
+// with the nested projection sample. No visual formula change is made here.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
 
 namespace banner_256
 {
-    static const DWORD HOOK_CLASSIFY      = 0x0042B84F;
-    static const DWORD HOOK_ENTRY         = 0x0042B97F;
-    static const DWORD HOOK_RENDER        = 0x00442B49;
-    static const DWORD HOOK_PROJECTION_E  = 0x0043FD2C;
-    static const DWORD HOOK_PROJECTION_F  = 0x0043FE24;
-    static const DWORD HOOK_ANCHOR        = 0x004504B8;
+    static const DWORD HOOK_CLASSIFY       = 0x0042B84F;
+    static const DWORD HOOK_ENTRY          = 0x0042B97F;
+    static const DWORD HOOK_RENDER         = 0x00442B49;
+    static const DWORD HOOK_PROJECTION_E   = 0x0043FD2C;
+    static const DWORD HOOK_PROJECTION_F   = 0x0043FE24;
+    static const DWORD HOOK_PROJECTION_G   = 0x00450427;
+    static const DWORD HOOK_ANCHOR         = 0x004504B8;
 
     static const DWORD RETURN_CLASSIFY     = 0x0042B854;
     static const DWORD RETURN_ENTRY        = 0x0042B986;
     static const DWORD RETURN_RENDER       = 0x00442B4E;
     static const DWORD RETURN_PROJECTION_E = 0x0043FD32;
     static const DWORD RETURN_PROJECTION_F = 0x0043FE2A;
+    static const DWORD RETURN_PROJECTION_G = 0x0045042C;
     static const DWORD RETURN_ANCHOR       = 0x004504BF;
+
+    static const DWORD CALL_PROJECT_BUFFER = 0x00427C30;
 
     static const BYTE kOriginalClassify[5] =
         { 0x8B,0x6F,0x48,0x85,0xED };
@@ -38,6 +42,8 @@ namespace banner_256
         { 0xD9,0x81,0x64,0x01,0x00,0x00 };
     static const BYTE kOriginalProjectionF[6] =
         { 0xD9,0xC9,0xDE,0xC2,0xD9,0xC9 };
+    static const BYTE kOriginalProjectionG[5] =
+        { 0xE8,0x04,0x78,0xFD,0xFF };
     static const BYTE kOriginalAnchor[7] =
         { 0xA1,0x14,0x37,0x50,0x00,0x2B,0xC2 };
 
@@ -77,6 +83,7 @@ namespace banner_256
     static BOOL g_loaded = FALSE;
 
     static volatile DWORD g_projectionWScratchBits = 0;
+    static volatile DWORD g_currentProjectionUnit = 0;
     static volatile DWORD g_lastProjectionUnit = 0;
     static volatile DWORD g_lastProjectionWBits = 0;
     static volatile DWORD g_lastProjectionSource = 0;
@@ -200,11 +207,13 @@ namespace banner_256
         return 0;
     }
 
-    static void __cdecl PublishProjectionSample(DWORD unit, DWORD source)
+    static void __cdecl PublishProjectionSample(DWORD ignoredUnit, DWORD source)
     {
+        (void)ignoredUnit;
         const DWORD bits = g_projectionWScratchBits;
-        if (bits == 0) return;
-        g_lastProjectionUnit = unit;
+        const DWORD owner = g_currentProjectionUnit;
+        if (bits == 0 || owner == 0) return;
+        g_lastProjectionUnit = owner;
         g_lastProjectionWBits = bits;
         g_lastProjectionSource = source;
         ++g_projectionSequence;
@@ -268,9 +277,6 @@ namespace banner_256
         const DWORD lastBits = g_lastProjectionWBits;
         const DWORD lastSource = g_lastProjectionSource;
 
-        // Diagnostic status is intentionally logged once for a positively
-        // classified 256 unit even when the exact-unit association fails.
-        // This tells us whether E/F fired at all and what ESI contained there.
         if (state->is256 && !state->loggedProjectionStatus)
         {
             union FLOAT_BITS { DWORD bits; float value; } raw;
@@ -328,7 +334,7 @@ namespace banner_256
 
     static BOOL BuildCaves()
     {
-        g_caves = (BYTE*)VirtualAlloc(NULL, 0x380, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        g_caves = (BYTE*)VirtualAlloc(NULL, 0x400, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (g_caves == NULL) return FALSE;
 
         BYTE* a = g_caves + 0x00; DWORD n = 0;
@@ -387,7 +393,17 @@ namespace banner_256
         DWORD jumpF = n; f[n++] = 0xE9; n += 4;
         WriteRel32(f + callF, (DWORD)&RecordProjectionWFromF); WriteRel32(f + jumpF, RETURN_PROJECTION_F);
 
-        FlushInstructionCache(GetCurrentProcess(), g_caves, 0x380); return TRUE;
+        BYTE* g = g_caves + 0x180; n = 0;
+        // Hook G: ESI is the true computeUnitScreenBounds unit. The original
+        // CALL argument has already been pushed, so stashing ESI is transparent.
+        g[n++] = 0x89; g[n++] = 0x35;
+        *((DWORD*)(g + n)) = (DWORD)&g_currentProjectionUnit; n += 4;
+        DWORD callG = n; g[n++] = 0xE8; n += 4;
+        DWORD jumpG = n; g[n++] = 0xE9; n += 4;
+        WriteRel32(g + callG, CALL_PROJECT_BUFFER);
+        WriteRel32(g + jumpG, RETURN_PROJECTION_G);
+
+        FlushInstructionCache(GetCurrentProcess(), g_caves, 0x400); return TRUE;
     }
 
     void Load()
@@ -398,22 +414,24 @@ namespace banner_256
             !BytesEqual(HOOK_RENDER,kOriginalRender,sizeof(kOriginalRender)) ||
             !BytesEqual(HOOK_PROJECTION_E,kOriginalProjectionE,sizeof(kOriginalProjectionE)) ||
             !BytesEqual(HOOK_PROJECTION_F,kOriginalProjectionF,sizeof(kOriginalProjectionF)) ||
+            !BytesEqual(HOOK_PROJECTION_G,kOriginalProjectionG,sizeof(kOriginalProjectionG)) ||
             !BytesEqual(HOOK_ANCHOR,kOriginalAnchor,sizeof(kOriginalAnchor)))
         {
             darkomen::detour::trace("Stage10 install FAIL byte guard"); FlushTrace(); return;
         }
         memset(g_units,0,sizeof(g_units)); memset(g_entryToUnit,0,sizeof(g_entryToUnit));
-        g_projectionWScratchBits = g_lastProjectionUnit = g_lastProjectionWBits = g_lastProjectionSource = g_projectionSequence = 0;
+        g_projectionWScratchBits = g_currentProjectionUnit = g_lastProjectionUnit = g_lastProjectionWBits = g_lastProjectionSource = g_projectionSequence = 0;
         if (!BuildCaves()) return;
         WriteJump(HOOK_CLASSIFY,(DWORD)(g_caves+0x00),5);
         WriteJump(HOOK_ENTRY,(DWORD)(g_caves+0x40),7);
         WriteJump(HOOK_RENDER,(DWORD)(g_caves+0x80),5);
         WriteJump(HOOK_PROJECTION_E,(DWORD)(g_caves+0x100),6);
         WriteJump(HOOK_PROJECTION_F,(DWORD)(g_caves+0x140),6);
+        WriteJump(HOOK_PROJECTION_G,(DWORD)(g_caves+0x180),5);
         WriteJump(HOOK_ANCHOR,(DWORD)(g_caves+0xC0),7);
         FlushInstructionCache(GetCurrentProcess(),NULL,0);
         g_loaded=TRUE;
-        darkomen::detour::trace("Stage10 installed: raw projection handoff diagnostic active; correction unchanged"); FlushTrace();
+        darkomen::detour::trace("Stage10 installed: Hook-G projection owner diagnostic active; correction unchanged"); FlushTrace();
     }
 
     void Unload()
@@ -424,9 +442,14 @@ namespace banner_256
         memcpy((void*)HOOK_RENDER,kOriginalRender,sizeof(kOriginalRender));
         memcpy((void*)HOOK_PROJECTION_E,kOriginalProjectionE,sizeof(kOriginalProjectionE));
         memcpy((void*)HOOK_PROJECTION_F,kOriginalProjectionF,sizeof(kOriginalProjectionF));
+        memcpy((void*)HOOK_PROJECTION_G,kOriginalProjectionG,sizeof(kOriginalProjectionG));
         memcpy((void*)HOOK_ANCHOR,kOriginalAnchor,sizeof(kOriginalAnchor));
         FlushInstructionCache(GetCurrentProcess(),NULL,0);
         if(g_caves!=NULL) VirtualFree(g_caves,0,MEM_RELEASE);
-        g_caves=NULL; memset(g_units,0,sizeof(g_units)); memset(g_entryToUnit,0,sizeof(g_entryToUnit)); g_loaded=FALSE;
+        g_caves=NULL;
+        memset(g_units,0,sizeof(g_units));
+        memset(g_entryToUnit,0,sizeof(g_entryToUnit));
+        g_projectionWScratchBits = g_currentProjectionUnit = g_lastProjectionUnit = g_lastProjectionWBits = g_lastProjectionSource = g_projectionSequence = 0;
+        g_loaded=FALSE;
     }
 }
