@@ -92,6 +92,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\armytmp.cpp" />
+    <ClCompile Include="src\banner_256.cpp" />
     <ClCompile Include="src\camera_elevation.cpp" />
     <ClCompile Include="src\ctl.cpp" />
     <ClCompile Include="src\detour.cpp" />
