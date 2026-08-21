@@ -4,7 +4,11 @@
 // that body's actual current rendered screen height, not a fixed screen-pixel
 // constant.
 //
-// Static tracing established four stable points in EngRel:
+// Static tracing established the existing four-hook Stage10 path plus a
+// fifth diagnostic projection hook.  Hook D's CPU-side billboard terms were
+// proven by trace to be world/view-space rather than final screen pixels; the
+// current visual correction is intentionally left unchanged while Hook E
+// measures the real homogeneous projection divisor used by the CPU projector.
 //   Hook A  0x0042B84F - buildUnitBodySpriteDrawQueue, hardware path.
 //                         EDI is the winning resource-template entry and
 //                         [ESP+0x10]+0x1C is the owning unit pointer.
@@ -13,31 +17,35 @@
 //                         icon-queue entry whose +0x1C field is the unit ptr.
 //   Hook D  0x00442B49 - FUN_00442B40, the hardware sprite quad builder.
 //                         ESI is param_4, exactly the same body draw-entry that
-//                         Hook C recorded.  The renderer's own live terms let
-//                         us reproduce the body's full on-screen height.
+//                         Hook C recorded.
+//   Hook E  0x0043FD2C - FUN_0043FC60 billboard projection branch.
+//                         ST0 holds the completed homogeneous W/fVar7 divisor;
+//                         ESI is the current unit pointer.  A non-popping FST
+//                         copies W to DLL-owned scratch storage.
 //   Hook B  0x004504B8 - computeUnitScreenBounds.
 //                         ESI is param_1 (the same unit pointer) for the whole
 //                         function; decreasing its final screen Y raises banner,
 //                         border, arrow, target marker and Engage hit area
 //                         together without changing their dimensions.
 //
-// No game structure is repurposed.  The entry->unit association and per-unit
-// class/rendered-height state are entirely DLL-owned.
+// No game structure is repurposed.  All diagnostic state is DLL-owned.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
 
 namespace banner_256
 {
-    static const DWORD HOOK_CLASSIFY = 0x0042B84F;
-    static const DWORD HOOK_ENTRY    = 0x0042B97F;
-    static const DWORD HOOK_RENDER   = 0x00442B49;
-    static const DWORD HOOK_ANCHOR   = 0x004504B8;
+    static const DWORD HOOK_CLASSIFY   = 0x0042B84F;
+    static const DWORD HOOK_ENTRY      = 0x0042B97F;
+    static const DWORD HOOK_RENDER     = 0x00442B49;
+    static const DWORD HOOK_PROJECTION = 0x0043FD2C;
+    static const DWORD HOOK_ANCHOR     = 0x004504B8;
 
-    static const DWORD RETURN_CLASSIFY = 0x0042B854;
-    static const DWORD RETURN_ENTRY    = 0x0042B986;
-    static const DWORD RETURN_RENDER   = 0x00442B4E;
-    static const DWORD RETURN_ANCHOR   = 0x004504BF;
+    static const DWORD RETURN_CLASSIFY   = 0x0042B854;
+    static const DWORD RETURN_ENTRY      = 0x0042B986;
+    static const DWORD RETURN_RENDER     = 0x00442B4E;
+    static const DWORD RETURN_PROJECTION = 0x0043FD32;
+    static const DWORD RETURN_ANCHOR     = 0x004504BF;
 
     static const BYTE kOriginalClassify[5] =
         { 0x8B,0x6F,0x48,0x85,0xED };
@@ -45,6 +53,8 @@ namespace banner_256
         { 0xC7,0x45,0x10,0x00,0x00,0x00,0x00 };
     static const BYTE kOriginalRender[5] =
         { 0x57,0x55,0x8B,0x4E,0x04 };
+    static const BYTE kOriginalProjection[6] =
+        { 0xD9,0x81,0x64,0x01,0x00,0x00 }; // fld dword ptr [ecx+164]
     static const BYTE kOriginalAnchor[7] =
         { 0xA1,0x14,0x37,0x50,0x00,0x2B,0xC2 };
 
@@ -62,6 +72,9 @@ namespace banner_256
         BOOL loggedHeight;
         BOOL loggedEdgeTerms;
         BOOL loggedRaise;
+        DWORD projectionWBits;
+        float lastLoggedProjectionW;
+        DWORD projectionLogCount;
     };
 
     struct ENTRY_UNIT_LINK
@@ -75,6 +88,11 @@ namespace banner_256
 
     static BYTE* g_caves = NULL;
     static BOOL g_loaded = FALSE;
+
+    // Hook E uses FST (not FSTP) so the game's x87 stack is untouched.  The
+    // helper copies only these raw IEEE-754 bits while the projection routine
+    // is active; float formatting is deferred until Hook B, after projection.
+    static volatile DWORD g_projectionWScratchBits = 0;
 
     static void FlushTrace()
     {
@@ -211,6 +229,18 @@ namespace banner_256
         return 0;
     }
 
+    static void __cdecl RecordProjectionWBits(DWORD unit)
+    {
+        // Keep this helper integer-only so the diagnostic call does not need to
+        // perform floating-point work while FUN_0043FC60's x87 stack is live.
+        UNIT_STATE* state = FindUnitState(unit);
+        if (state == NULL || !state->is256) return;
+
+        const DWORD bits = g_projectionWScratchBits;
+        if (bits != 0)
+            state->projectionWBits = bits;
+    }
+
     static void __cdecl CaptureRenderedHeight(DWORD entry)
     {
         const DWORD unit = FindUnitForEntry(entry);
@@ -279,6 +309,36 @@ namespace banner_256
         UNIT_STATE* state = FindUnitState(unit);
         if (state == NULL || !state->is256) return 0;
 
+        if (state->projectionWBits != 0 && state->projectionLogCount < 16)
+        {
+            union FLOAT_BITS
+            {
+                DWORD bits;
+                float value;
+            } wBits;
+            wBits.bits = state->projectionWBits;
+
+            float w = wBits.value;
+            float absW = (w < 0.0f) ? -w : w;
+            float delta = w - state->lastLoggedProjectionW;
+            if (delta < 0.0f) delta = -delta;
+
+            // Log the first sample, then only material changes so a stationary
+            // unit does not fill trace.txt every frame.  0.25 is diagnostic
+            // throttling only; it is not used by the banner correction.
+            if (absW > 0.0001f && absW < 1000000.0f &&
+                (state->projectionLogCount == 0 || delta >= 0.25f))
+            {
+                const LONG screenY = *((volatile LONG*)0x00503714);
+                darkomen::detour::trace(
+                    "Stage10 projectionW unit=%08lX W=%.6f screenY=%ld sample=%lu",
+                    unit, w, screenY, state->projectionLogCount + 1);
+                FlushTrace();
+                state->lastLoggedProjectionW = w;
+                ++state->projectionLogCount;
+            }
+        }
+
         const float h = state->renderedHeight;
         if (!(h > 0.0f && h < 4096.0f)) return 0;
 
@@ -297,7 +357,7 @@ namespace banner_256
 
     static BOOL BuildCaves()
     {
-        g_caves = (BYTE*)VirtualAlloc(NULL, 0x200, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        g_caves = (BYTE*)VirtualAlloc(NULL, 0x300, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (g_caves == NULL)
         {
             Log("banner_256: VirtualAlloc failed (%lu)", GetLastError());
@@ -361,6 +421,29 @@ namespace banner_256
         WriteRel32(d + callD, (DWORD)&CaptureRenderedHeight);
         WriteRel32(d + jumpD, RETURN_RENDER);
 
+        BYTE* e = g_caves + 0x100;
+        n = 0;
+
+        // Hook E, entered at 0x0043FD2C.  ST0 already contains completed
+        // fVar7/W.  FST m32 stores without popping, then we recreate the
+        // displaced FLD [ECX+164] before preserving integer state.
+        e[n++] = 0xD9; e[n++] = 0x15;                       // fst dword ptr [abs32]
+        *((DWORD*)(e + n)) = (DWORD)&g_projectionWScratchBits; n += 4;
+        e[n++] = 0xD9; e[n++] = 0x81;                       // fld dword ptr [ecx+164]
+        e[n++] = 0x64; e[n++] = 0x01; e[n++] = 0x00; e[n++] = 0x00;
+        e[n++] = 0x9C;
+        e[n++] = 0x60;
+        e[n++] = 0x56;
+        DWORD callE = n;
+        e[n++] = 0xE8; n += 4;
+        e[n++] = 0x83; e[n++] = 0xC4; e[n++] = 0x04;
+        e[n++] = 0x61;
+        e[n++] = 0x9D;
+        DWORD jumpE = n;
+        e[n++] = 0xE9; n += 4;
+        WriteRel32(e + callE, (DWORD)&RecordProjectionWBits);
+        WriteRel32(e + jumpE, RETURN_PROJECTION);
+
         BYTE* b = g_caves + 0xC0;
         n = 0;
         b[n++] = 0xA1;
@@ -385,7 +468,7 @@ namespace banner_256
         WriteRel32(b + callB, (DWORD)&GetUnitAnchorRaise);
         WriteRel32(b + jumpB, RETURN_ANCHOR);
 
-        FlushInstructionCache(GetCurrentProcess(), g_caves, 0x200);
+        FlushInstructionCache(GetCurrentProcess(), g_caves, 0x300);
         return TRUE;
     }
 
@@ -411,6 +494,12 @@ namespace banner_256
             darkomen::detour::trace("Stage10 install FAIL byte-guard 0x00442B49"); FlushTrace();
             return;
         }
+        if (!BytesEqual(HOOK_PROJECTION, kOriginalProjection, sizeof(kOriginalProjection)))
+        {
+            Log("banner_256: EngRel mismatch at 0x0043FD2C; Stage10 not installed");
+            darkomen::detour::trace("Stage10 install FAIL byte-guard 0x0043FD2C"); FlushTrace();
+            return;
+        }
         if (!BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)))
         {
             Log("banner_256: EngRel mismatch at 0x004504B8; Stage10 not installed");
@@ -420,18 +509,20 @@ namespace banner_256
 
         memset(g_units, 0, sizeof(g_units));
         memset(g_entryToUnit, 0, sizeof(g_entryToUnit));
+        g_projectionWScratchBits = 0;
 
         if (!BuildCaves()) return;
 
-        WriteJump(HOOK_CLASSIFY, (DWORD)(g_caves + 0x00), 5);
-        WriteJump(HOOK_ENTRY,    (DWORD)(g_caves + 0x40), 7);
-        WriteJump(HOOK_RENDER,   (DWORD)(g_caves + 0x80), 5);
-        WriteJump(HOOK_ANCHOR,   (DWORD)(g_caves + 0xC0), 7);
+        WriteJump(HOOK_CLASSIFY,   (DWORD)(g_caves + 0x00), 5);
+        WriteJump(HOOK_ENTRY,      (DWORD)(g_caves + 0x40), 7);
+        WriteJump(HOOK_RENDER,     (DWORD)(g_caves + 0x80), 5);
+        WriteJump(HOOK_PROJECTION, (DWORD)(g_caves + 0x100), 6);
+        WriteJump(HOOK_ANCHOR,     (DWORD)(g_caves + 0xC0), 7);
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
 
         g_loaded = TRUE;
-        Log("banner_256: Stage10 edge-term diagnostic installed");
-        darkomen::detour::trace("Stage10 installed: edge-term diagnostic active; correction unchanged");
+        Log("banner_256: Stage10 projection-W diagnostic installed");
+        darkomen::detour::trace("Stage10 installed: projection-W diagnostic active; correction unchanged");
         FlushTrace();
     }
 
@@ -442,6 +533,7 @@ namespace banner_256
         memcpy((void*)HOOK_CLASSIFY, kOriginalClassify, sizeof(kOriginalClassify));
         memcpy((void*)HOOK_ENTRY, kOriginalEntry, sizeof(kOriginalEntry));
         memcpy((void*)HOOK_RENDER, kOriginalRender, sizeof(kOriginalRender));
+        memcpy((void*)HOOK_PROJECTION, kOriginalProjection, sizeof(kOriginalProjection));
         memcpy((void*)HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor));
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
 
@@ -451,6 +543,7 @@ namespace banner_256
         g_caves = NULL;
         memset(g_units, 0, sizeof(g_units));
         memset(g_entryToUnit, 0, sizeof(g_entryToUnit));
+        g_projectionWScratchBits = 0;
         g_loaded = FALSE;
     }
 }
