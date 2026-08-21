@@ -9,9 +9,9 @@
 // still the true unit pointer, and publishes that pointer for E/F to associate
 // with the nested projection sample. The stable-W sampler records valid W at a
 // low fixed time cadence even when the camera is stationary. F11 temporarily
-// moves only the positively classified 256x256 unit overlay/interaction anchor
-// far off-screen for calibration, leaving the body sprite and normal HUD alone.
-// No shipping visual anchor formula change is made here.
+// toggles the game's DisplayOverlays flag so a calibration screenshot can show
+// the unobstructed 256x256 body at exactly the same camera position. No visual
+// anchor formula change is made here.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -53,7 +53,7 @@ namespace banner_256
 
     static const DWORD RENDER_HEIGHT_TERM = 0x00502B6C;
     static const DWORD CAMERA_UP_Y        = 0x00502B84;
-    static const int CALIBRATION_HIDE_RAISE = 4096;
+    static const DWORD DISPLAY_OVERLAYS    = 0x004BF0F0;
 
     struct UNIT_STATE
     {
@@ -95,8 +95,9 @@ namespace banner_256
     static volatile DWORD g_lastProjectionSource = 0;
     static volatile DWORD g_projectionSequence = 0;
 
-    static BOOL g_bannerToggleKeyWasDown = FALSE;
-    static BOOL g_hide256BannerForCalibration = FALSE;
+    static BOOL g_overlayToggleKeyWasDown = FALSE;
+    static BOOL g_overlayWasToggled = FALSE;
+    static DWORD g_originalDisplayOverlays = 1;
 
     static void FlushTrace()
     {
@@ -104,18 +105,20 @@ namespace banner_256
             fflush(darkomen::detour::traceFile);
     }
 
-    static void PollBannerCalibrationToggle()
+    static void PollOverlayCalibrationToggle()
     {
         const BOOL keyDown = (GetAsyncKeyState(VK_F11) & 0x8000) ? TRUE : FALSE;
-        if (keyDown && !g_bannerToggleKeyWasDown)
+        if (keyDown && !g_overlayToggleKeyWasDown)
         {
-            g_hide256BannerForCalibration = g_hide256BannerForCalibration ? FALSE : TRUE;
-            darkomen::detour::trace(
-                "Stage10 bannerToggle key=F11 hide256Banner=%lu",
-                g_hide256BannerForCalibration ? 1UL : 0UL);
+            volatile DWORD* displayOverlays = (volatile DWORD*)DISPLAY_OVERLAYS;
+            const DWORD current = *displayOverlays;
+            const DWORD next = current ? 0UL : 1UL;
+            *displayOverlays = next;
+            g_overlayWasToggled = TRUE;
+            darkomen::detour::trace("Stage10 overlayToggle key=F11 DisplayOverlays=%lu", next);
             FlushTrace();
         }
-        g_bannerToggleKeyWasDown = keyDown;
+        g_overlayToggleKeyWasDown = keyDown;
     }
 
     static BOOL BytesEqual(DWORD address, const BYTE* expected, DWORD count)
@@ -296,7 +299,7 @@ namespace banner_256
         if (state == NULL) return 0;
 
         if (state->is256)
-            PollBannerCalibrationToggle();
+            PollOverlayCalibrationToggle();
 
         const DWORD sequence = g_projectionSequence;
         const DWORD lastUnit = g_lastProjectionUnit;
@@ -346,13 +349,6 @@ namespace banner_256
         }
 
         if (!state->is256) return 0;
-
-        // Calibration-only hide: Hook B is the proven shared 256-unit overlay /
-        // interaction anchor. Moving it far above the viewport removes the
-        // Dread King banner without changing the body sprite or normal HUD.
-        if (g_hide256BannerForCalibration)
-            return CALIBRATION_HIDE_RAISE;
-
         const float h = state->renderedHeight;
         if (!(h > 0.0f && h < 4096.0f)) return 0;
         const int raise = (int)(h * 0.25f + 0.5f);
@@ -454,8 +450,9 @@ namespace banner_256
         }
         memset(g_units,0,sizeof(g_units)); memset(g_entryToUnit,0,sizeof(g_entryToUnit));
         g_projectionWScratchBits = g_currentProjectionUnit = g_lastProjectionUnit = g_lastProjectionWBits = g_lastProjectionSource = g_projectionSequence = 0;
-        g_bannerToggleKeyWasDown = FALSE;
-        g_hide256BannerForCalibration = FALSE;
+        g_originalDisplayOverlays = *((volatile DWORD*)DISPLAY_OVERLAYS);
+        g_overlayToggleKeyWasDown = FALSE;
+        g_overlayWasToggled = FALSE;
         if (!BuildCaves()) return;
         WriteJump(HOOK_CLASSIFY,(DWORD)(g_caves+0x00),5);
         WriteJump(HOOK_ENTRY,(DWORD)(g_caves+0x40),7);
@@ -466,8 +463,8 @@ namespace banner_256
         WriteJump(HOOK_ANCHOR,(DWORD)(g_caves+0xC0),7);
         FlushInstructionCache(GetCurrentProcess(),NULL,0);
         g_loaded=TRUE;
-        darkomen::detour::trace("Stage10 installed: Hook-G stableW + F11 256-banner hide calibration diagnostic active; correction unchanged");
-        darkomen::detour::trace("Stage10 bannerCalibration initial hide256Banner=0; press F11 to toggle");
+        darkomen::detour::trace("Stage10 installed: Hook-G stableW + F11 overlay calibration diagnostic active; correction unchanged");
+        darkomen::detour::trace("Stage10 overlayCalibration initial DisplayOverlays=%lu; press F11 to toggle", g_originalDisplayOverlays);
         FlushTrace();
     }
 
@@ -482,13 +479,15 @@ namespace banner_256
         memcpy((void*)HOOK_PROJECTION_G,kOriginalProjectionG,sizeof(kOriginalProjectionG));
         memcpy((void*)HOOK_ANCHOR,kOriginalAnchor,sizeof(kOriginalAnchor));
         FlushInstructionCache(GetCurrentProcess(),NULL,0);
+        if (g_overlayWasToggled)
+            *((volatile DWORD*)DISPLAY_OVERLAYS) = g_originalDisplayOverlays;
         if(g_caves!=NULL) VirtualFree(g_caves,0,MEM_RELEASE);
         g_caves=NULL;
         memset(g_units,0,sizeof(g_units));
         memset(g_entryToUnit,0,sizeof(g_entryToUnit));
         g_projectionWScratchBits = g_currentProjectionUnit = g_lastProjectionUnit = g_lastProjectionWBits = g_lastProjectionSource = g_projectionSequence = 0;
-        g_bannerToggleKeyWasDown = FALSE;
-        g_hide256BannerForCalibration = FALSE;
+        g_overlayToggleKeyWasDown = FALSE;
+        g_overlayWasToggled = FALSE;
         g_loaded=FALSE;
     }
 }
