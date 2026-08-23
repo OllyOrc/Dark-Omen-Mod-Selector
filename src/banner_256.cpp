@@ -10,6 +10,12 @@
 // almost at the full 256 banner height while preserving smooth interpolation for
 // arbitrary enlarged sprites. Hooks E/F/G provide homogeneous W for zoom scaling
 // and Hook B applies the shared overlay / interaction correction.
+//
+// Current diagnostic: dump the sprite-owner layout once per unit so we can find
+// the native frame-count field and pre-scan the complete sprite envelope at first
+// sight. That will let enlarged 128x128 winners receive their correct cached K
+// immediately instead of waiting for a later facing/camera pass to expose a tall
+// frame. The diagnostic is temporary and will be removed from the shipping build.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -80,6 +86,7 @@ namespace banner_256
         BOOL loggedExtent;
         BOOL loggedRaise;
         BOOL loggedRawFrame;
+        BOOL loggedOwner;
         DWORD projectionWBits;
         DWORD projectionSequence;
     };
@@ -174,6 +181,7 @@ namespace banner_256
                 state->loggedExtent = FALSE;
                 state->loggedRaise = FALSE;
                 state->loggedRawFrame = FALSE;
+                state->loggedOwner = FALSE;
             }
 
             if (!state->loggedClass)
@@ -250,6 +258,20 @@ namespace banner_256
 
         const LONG frameIndex = *((LONG*)(entry + 0x04));
         if (frameIndex < 0 || frameIndex > 4096) return;
+
+        if (!state->loggedOwner)
+        {
+            const DWORD* o = (const DWORD*)owner;
+            darkomen::detour::trace(
+                "Stage11 ownerRaw unit=%08lX owner=%08lX frameBase=%08lX frame=%ld "
+                "o00=%08lX o04=%08lX o08=%08lX o0C=%08lX o10=%08lX o14=%08lX "
+                "o18=%08lX o1C=%08lX o20=%08lX o24=%08lX o28=%08lX",
+                unit, owner, frameBase, frameIndex,
+                o[0], o[1], o[2], o[3], o[4], o[5],
+                o[6], o[7], o[8], o[9], o[10]);
+            FlushTrace();
+            state->loggedOwner = TRUE;
+        }
 
         const DWORD frameRecord = frameBase + ((DWORD)frameIndex * 0x2C);
 
@@ -570,7 +592,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: three-point continuous K=650/1100/1800 banner scaling active");
+            "Stage11 installed: owner-layout diagnostic + K=650/1100/1800 scaling active");
         FlushTrace();
     }
 
