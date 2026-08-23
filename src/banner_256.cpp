@@ -82,6 +82,7 @@ namespace banner_256
     static volatile DWORD g_lastProjectionUnit = 0;
     static volatile DWORD g_lastProjectionWBits = 0;
     static volatile DWORD g_projectionSequence = 0;
+    static volatile DWORD g_classifyDiagnosticCount = 0;
 
     static void FlushTrace()
     {
@@ -146,6 +147,19 @@ namespace banner_256
         const DWORD width  = *((DWORD*)(templateEntry + 0x18));
         const DWORD height = *((DWORD*)(templateEntry + 0x1C));
         const BOOL extendedTall = IsExtendedTallClass(width, height);
+
+        // Temporary selector diagnostic: unlike the normal Stage11 messages,
+        // this deliberately records the actual winning template on every early
+        // body-resource pass. It is capped so the trace cannot grow unbounded.
+        if (g_classifyDiagnosticCount < 160)
+        {
+            ++g_classifyDiagnosticCount;
+            darkomen::detour::trace(
+                "Stage11 selectorWin #%lu unit=%08lX template=%08lX width=%lu height=%lu extended=%lu",
+                g_classifyDiagnosticCount, unit, templateEntry, width, height,
+                extendedTall ? 1UL : 0UL);
+            FlushTrace();
+        }
 
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state == NULL) return;
@@ -244,9 +258,6 @@ namespace banner_256
         if (frameScale < 0.0f) frameScale = -frameScale;
         if (yOffsetRatio < 0.0f) yOffsetRatio = -yOffsetRatio;
 
-        // Both extended tall classes have a 256-pixel backing height, so once
-        // either is positively identified the original Y offset can be recovered
-        // directly from the frame ratios.
         const float backingHeight = (state->resourceHeight == 256) ? 256.0f :
                                     ((state->resourceHeight == 128) ? 128.0f : 0.0f);
         if (backingHeight <= 0.0f) return;
@@ -296,8 +307,6 @@ namespace banner_256
     {
         if (state == NULL || state->resourceHeight != 256) return 0.0f;
 
-        // Before frame measurement arrives, use a conservative medium correction
-        // for 128x256 and preserve full correction for a true 256x256 resource.
         if (state->topExtentPx <= 0.0f)
             return (state->resourceWidth == 128) ? ANCHOR_K_MEDIUM : ANCHOR_K_LARGE;
 
@@ -479,6 +488,7 @@ namespace banner_256
         g_lastProjectionUnit = 0;
         g_lastProjectionWBits = 0;
         g_projectionSequence = 0;
+        g_classifyDiagnosticCount = 0;
 
         if (!BuildCaves()) return;
 
@@ -493,7 +503,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: 128x256 medium/large + 256x256 large banner correction active");
+            "Stage11 installed: selector diagnostic + 128x256/256x256 banner tiers active");
         FlushTrace();
     }
 
@@ -521,6 +531,7 @@ namespace banner_256
         g_lastProjectionUnit = 0;
         g_lastProjectionWBits = 0;
         g_projectionSequence = 0;
+        g_classifyDiagnosticCount = 0;
         g_loaded = FALSE;
     }
 }
