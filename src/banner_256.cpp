@@ -1,14 +1,14 @@
-// Stage11: zoom-aware banner positioning with an intermediate enlarged-body tier.
+// Stage11: zoom-aware banner positioning with continuous enlarged-body scaling.
 //
-// Dark Omen can report a 133%-scaled Troll as a 128x128 winner even though it
-// is visibly larger. The frame record also reports a render-space proxy rather
-// than RDose's literal source dimensions: the proven 133% Troll measured here as
-// bodyH=100/top=113 while RDose reports roughly 63x152 with Y=-154. Therefore we
-// use that runtime proxy to identify the intermediate tier, while preserving the
-// proven 256-resource K=1800 path. This diagnostic build also records the raw
-// 0x2C-byte body frame record once per unit so we can locate the native SPR
-// X/Y/width/height values and replace the proxy heuristic with true continuous
-// native-size scaling. Hooks E/F/G provide homogeneous W for zoom scaling and
+// Dark Omen can report enlarged sprites through either nominal 128x128 or the
+// added 128x256 resource bucket. The render frame record provides a stable
+// per-body top-extent proxy even though it does not expose RDose's literal source
+// dimensions directly. We calibrate once from the first valid body frame for a
+// live unit and continuously interpolate the banner correction between the
+// proven 133%-Troll point (top~=113, K=650) and the full-size point
+// (top~=165+, K=1800). This prevents ~202px sprites from jumping straight to the
+// maximum correction while preserving vanilla original units and the proven
+// 256x256 full-size path. Hooks E/F/G provide homogeneous W for zoom scaling and
 // Hook B applies the shared overlay / interaction correction.
 #include "header.h"
 #include "detour.h"
@@ -52,11 +52,16 @@ namespace banner_256
     static const float ANCHOR_K_MEDIUM = 650.0f;
     static const float ANCHOR_K_LARGE  = 1800.0f;
 
-    // Runtime proxy thresholds calibrated from the 133% Troll trace:
-    // bodyH=100/top=113. The second nominal 128x128 sample was bodyH=98/top=101.
+    // The 133%-scaled Troll measured top~=113 and looks correct at K=650.
+    // The ~202px Troll measured top~=150, which interpolates to ~1468 rather
+    // than jumping to the maximum. Full-size sprites reach K=1800 at ~165+.
+    static const float CONTINUOUS_TOP_MEDIUM = 113.0f;
+    static const float CONTINUOUS_TOP_LARGE  = 165.0f;
+
+    // Conservative guard for nominal 128x128 winners. This is the proven
+    // enlarged 133%-Troll envelope and keeps ordinary original units vanilla.
     static const float MEDIUM_BODY_MIN = 99.0f;
     static const float MEDIUM_TOP_MIN  = 110.0f;
-    static const float LARGE_TOP_MIN   = 150.0f;
 
     struct UNIT_STATE
     {
@@ -65,6 +70,8 @@ namespace banner_256
         DWORD resourceHeight;
         float bodyHeightPx;
         float topExtentPx;
+        float calibrationTopPx;
+        BOOL hasCalibrationTop;
         BOOL loggedClass;
         BOOL loggedSuppressedSmaller;
         BOOL loggedExtent;
@@ -157,6 +164,10 @@ namespace banner_256
             {
                 state->resourceWidth = width;
                 state->resourceHeight = height;
+                state->bodyHeightPx = 0.0f;
+                state->topExtentPx = 0.0f;
+                state->calibrationTopPx = 0.0f;
+                state->hasCalibrationTop = FALSE;
                 state->loggedExtent = FALSE;
                 state->loggedRaise = FALSE;
                 state->loggedRawFrame = FALSE;
@@ -267,6 +278,17 @@ namespace banner_256
         if (!(nativeHeight > 0.0f && nativeHeight < 1024.0f)) return;
         if (!(topExtent > 0.0f && topExtent < 1024.0f)) return;
 
+        // Calibrate once from the first valid body frame. Later animation/body
+        // passes can have very different extents (the ~202px Troll later reached
+        // proxy values 160/308), which must not cause the banner to jump between
+        // tiers while the unit animates.
+        if (!state->hasCalibrationTop)
+        {
+            state->calibrationTopPx = topExtent;
+            state->hasCalibrationTop = TRUE;
+            state->loggedRaise = FALSE;
+        }
+
         BOOL changed = FALSE;
         if (nativeHeight > state->bodyHeightPx)
         {
@@ -278,21 +300,15 @@ namespace banner_256
             state->topExtentPx = topExtent;
             changed = TRUE;
         }
-        if (changed)
+        if (changed && !state->hasCalibrationTop)
             state->loggedRaise = FALSE;
 
         if (!state->loggedExtent)
         {
-            const char* tier = "vanilla";
-            if (state->resourceHeight == 256)
-                tier = (state->topExtentPx >= LARGE_TOP_MIN) ? "large" : "medium";
-            else if (state->bodyHeightPx >= MEDIUM_BODY_MIN && state->topExtentPx >= MEDIUM_TOP_MIN)
-                tier = "medium";
-
             darkomen::detour::trace(
-                "Stage11 bodyProxy unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f tier=%s",
+                "Stage11 bodyProxy unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f calibrationTop=%.1f",
                 unit, state->resourceWidth, state->resourceHeight,
-                state->bodyHeightPx, state->topExtentPx, tier);
+                state->bodyHeightPx, state->topExtentPx, state->calibrationTopPx);
             FlushTrace();
             state->loggedExtent = TRUE;
         }
@@ -315,21 +331,49 @@ namespace banner_256
         PublishProjectionSample(unit);
     }
 
+    static float ContinuousAnchorK(float top)
+    {
+        if (top <= CONTINUOUS_TOP_MEDIUM)
+            return ANCHOR_K_MEDIUM;
+        if (top >= CONTINUOUS_TOP_LARGE)
+            return ANCHOR_K_LARGE;
+
+        const float scale =
+            (top - CONTINUOUS_TOP_MEDIUM) /
+            (CONTINUOUS_TOP_LARGE - CONTINUOUS_TOP_MEDIUM);
+        return ANCHOR_K_MEDIUM +
+            scale * (ANCHOR_K_LARGE - ANCHOR_K_MEDIUM);
+    }
+
     static float GetAnchorK(const UNIT_STATE* state)
     {
         if (state == NULL) return 0.0f;
 
-        if (state->resourceHeight == 256)
+        // A true 256x256 winner remains the proven full-size path.
+        if (state->resourceHeight == 256 && state->resourceWidth == 256)
+            return ANCHOR_K_LARGE;
+
+        // 128x256 is the physical bucket for intermediate/tall sprites. Before
+        // the first body frame is seen, use the safe K=650 fallback; afterward
+        // continuously interpolate from K=650 to K=1800 using calibrationTop.
+        if (state->resourceHeight == 256 && state->resourceWidth == 128)
         {
-            if (state->resourceWidth == 256) return ANCHOR_K_LARGE;
-            if (state->topExtentPx >= LARGE_TOP_MIN) return ANCHOR_K_LARGE;
-            return ANCHOR_K_MEDIUM;
+            if (!state->hasCalibrationTop)
+                return ANCHOR_K_MEDIUM;
+            return ContinuousAnchorK(state->calibrationTopPx);
         }
 
+        // Some enlarged sprites (the proven 133% Troll) can still win 128x128.
+        // Promote only the conservative enlarged-body envelope, but use the same
+        // continuous function if their measured top grows beyond the medium case.
         if (state->resourceHeight == 128 &&
             state->bodyHeightPx >= MEDIUM_BODY_MIN &&
             state->topExtentPx >= MEDIUM_TOP_MIN)
-            return ANCHOR_K_MEDIUM;
+        {
+            const float top = state->hasCalibrationTop ?
+                state->calibrationTopPx : state->topExtentPx;
+            return ContinuousAnchorK(top);
+        }
 
         return 0.0f;
     }
@@ -366,9 +410,10 @@ namespace banner_256
         if (safeRaise > 0 && !state->loggedRaise)
         {
             darkomen::detour::trace(
-                "Stage11 anchorRaiseK unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f W=%.6f K=%.1f raise=%d",
+                "Stage11 anchorRaiseK unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f calibrationTop=%.1f W=%.6f K=%.1f raise=%d",
                 unit, state->resourceWidth, state->resourceHeight,
-                state->bodyHeightPx, state->topExtentPx, w, anchorK, safeRaise);
+                state->bodyHeightPx, state->topExtentPx, state->calibrationTopPx,
+                w, anchorK, safeRaise);
             FlushTrace();
             state->loggedRaise = TRUE;
         }
@@ -521,7 +566,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: native-frame record diagnostic + existing K=650/K=1800 active");
+            "Stage11 installed: continuous K=650..1800 enlarged-body banner scaling active");
         FlushTrace();
     }
 
