@@ -1,16 +1,12 @@
-// Stage10 final positioning with an intermediate large-sprite banner tier.
+// Stage11: tiered banner positioning for enlarged sprite resource classes.
 //
-// Original-sized sprites keep vanilla overlay / interaction placement. Units
-// whose body uses the 256x256 resource path are additionally measured from the
-// body frame's native Y origin. This lets moderately enlarged sprites (for
-// example the 133% Troll) receive a smaller zoom-aware raise than genuinely
-// large 256 sprites, while preserving the proven K=1900 correction for Dread
-// King / full-size large sprites.
-//
-// Hook A identifies the body resource class. Hooks C/D associate the body draw
-// entry with its live unit and recover the native top extent from the frame
-// data. Hooks E/F/G capture homogeneous W for zoom scaling. Hook B applies the
-// shared overlay / interaction correction.
+// Original-sized sprites keep vanilla overlay / interaction placement. The new
+// 128x256 class provides a true intermediate resource bucket for moderately
+// enlarged tall sprites, while 256x256 remains available for the largest units.
+// Hooks C/D recover each body's native top extent so 128x256 sprites can still
+// choose medium (K=650) or large (K=1900) banner spacing from their real height.
+// Hooks E/F/G capture homogeneous W for zoom scaling. Hook B applies the shared
+// overlay / interaction correction.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -50,8 +46,6 @@ namespace banner_256
     static const BYTE kOriginalAnchor[7] =
         { 0xA1,0x14,0x37,0x50,0x00,0x2B,0xC2 };
 
-    // Calibrated full-size value plus an intermediate tier for sprites whose
-    // top extent is larger than vanilla but still well below the full 256 case.
     static const float ANCHOR_K_MEDIUM = 650.0f;
     static const float ANCHOR_K_LARGE  = 1900.0f;
     static const float MEDIUM_TOP_MIN   = 130.0f;
@@ -60,10 +54,11 @@ namespace banner_256
     struct UNIT_STATE
     {
         DWORD unit;
-        BOOL is256;
+        DWORD resourceWidth;
+        DWORD resourceHeight;
         float topExtentPx;
-        BOOL loggedClass256;
-        BOOL loggedSuppressedFalse;
+        BOOL loggedClass;
+        BOOL loggedSuppressedSmaller;
         BOOL loggedExtent;
         BOOL loggedRaise;
         DWORD projectionWBits;
@@ -139,47 +134,61 @@ namespace banner_256
         return &g_units[freeSlot];
     }
 
+    static BOOL IsExtendedTallClass(DWORD width, DWORD height)
+    {
+        return (height == 256 && (width == 128 || width == 256)) ? TRUE : FALSE;
+    }
+
     static void __cdecl MarkUnitClass(DWORD unit, DWORD templateEntry)
     {
         if (unit == 0 || templateEntry == 0) return;
 
         const DWORD width  = *((DWORD*)(templateEntry + 0x18));
         const DWORD height = *((DWORD*)(templateEntry + 0x1C));
-        const BOOL is256 = (width == 256 && height == 256) ? TRUE : FALSE;
+        const BOOL extendedTall = IsExtendedTallClass(width, height);
 
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state == NULL) return;
 
-        // Keep positive 256 identification sticky: auxiliary passes can later
-        // use smaller templates and must not demote the live unit.
-        if (is256)
+        // A positive 128x256/256x256 body classification is sticky. Later
+        // auxiliary passes may use 128x128 and must not demote the live unit.
+        if (extendedTall)
         {
-            state->is256 = TRUE;
-            if (!state->loggedClass256)
+            // Prefer 256x256 if both extended classes are ever seen.
+            if (state->resourceHeight != 256 || width > state->resourceWidth)
+            {
+                state->resourceWidth = width;
+                state->resourceHeight = height;
+                state->loggedExtent = FALSE;
+                state->loggedRaise = FALSE;
+            }
+
+            if (!state->loggedClass)
             {
                 darkomen::detour::trace(
-                    "Stage10 class256 detected unit=%08lX template=%08lX width=%lu height=%lu",
+                    "Stage11 extendedClass detected unit=%08lX template=%08lX width=%lu height=%lu",
                     unit, templateEntry, width, height);
                 FlushTrace();
-                state->loggedClass256 = TRUE;
+                state->loggedClass = TRUE;
             }
             return;
         }
 
-        if (state->is256)
+        if (state->resourceHeight == 256)
         {
-            if (!state->loggedSuppressedFalse)
+            if (!state->loggedSuppressedSmaller)
             {
                 darkomen::detour::trace(
-                    "Stage10 suppressed TRUE->FALSE unit=%08lX template=%08lX width=%lu height=%lu",
+                    "Stage11 suppressed extended->smaller unit=%08lX template=%08lX width=%lu height=%lu",
                     unit, templateEntry, width, height);
                 FlushTrace();
-                state->loggedSuppressedFalse = TRUE;
+                state->loggedSuppressedSmaller = TRUE;
             }
             return;
         }
 
-        state->is256 = FALSE;
+        state->resourceWidth = width;
+        state->resourceHeight = height;
     }
 
     static void __cdecl RecordEntryUnit(DWORD entry, DWORD unit)
@@ -235,12 +244,13 @@ namespace banner_256
         if (frameScale < 0.0f) frameScale = -frameScale;
         if (yOffsetRatio < 0.0f) yOffsetRatio = -yOffsetRatio;
 
-        // For the 256-backed body resource, +0x14 is nativeFrameHeight / 256
-        // and +0x1C is nativeYOffset / nativeFrameHeight. Their product therefore
-        // recovers the native Y-origin magnitude (the useful top extent). If the
-        // 256 classification has not landed yet, retain the sample but use 128 as
-        // the conservative backing height; a later 256 body pass will replace it.
-        const float backingHeight = state->is256 ? 256.0f : 128.0f;
+        // Both extended tall classes have a 256-pixel backing height, so once
+        // either is positively identified the original Y offset can be recovered
+        // directly from the frame ratios.
+        const float backingHeight = (state->resourceHeight == 256) ? 256.0f :
+                                    ((state->resourceHeight == 128) ? 128.0f : 0.0f);
+        if (backingHeight <= 0.0f) return;
+
         const float nativeHeight = frameScale * backingHeight;
         const float topExtent = yOffsetRatio * nativeHeight;
         if (!(topExtent > 0.0f && topExtent < 1024.0f)) return;
@@ -251,13 +261,14 @@ namespace banner_256
             state->loggedRaise = FALSE;
         }
 
-        if (!state->loggedExtent && state->is256)
+        if (!state->loggedExtent && state->resourceHeight == 256)
         {
             const char* tier = (state->topExtentPx >= LARGE_TOP_MIN) ? "large" :
                                ((state->topExtentPx >= MEDIUM_TOP_MIN) ? "medium" : "vanilla");
             darkomen::detour::trace(
-                "Stage10 bodyExtent unit=%08lX top=%.1f frameH=%.1f tier=%s",
-                unit, state->topExtentPx, nativeHeight, tier);
+                "Stage11 bodyExtent unit=%08lX resource=%lux%lu top=%.1f frameH=%.1f tier=%s",
+                unit, state->resourceWidth, state->resourceHeight,
+                state->topExtentPx, nativeHeight, tier);
             FlushTrace();
             state->loggedExtent = TRUE;
         }
@@ -283,11 +294,13 @@ namespace banner_256
 
     static float GetAnchorK(const UNIT_STATE* state)
     {
-        if (state == NULL || !state->is256) return 0.0f;
+        if (state == NULL || state->resourceHeight != 256) return 0.0f;
 
-        // Until the body frame measurement arrives, preserve the already-tested
-        // full 256 behaviour rather than momentarily dropping to vanilla.
-        if (state->topExtentPx <= 0.0f) return ANCHOR_K_LARGE;
+        // Before frame measurement arrives, use a conservative medium correction
+        // for 128x256 and preserve full correction for a true 256x256 resource.
+        if (state->topExtentPx <= 0.0f)
+            return (state->resourceWidth == 128) ? ANCHOR_K_MEDIUM : ANCHOR_K_LARGE;
+
         if (state->topExtentPx >= LARGE_TOP_MIN) return ANCHOR_K_LARGE;
         if (state->topExtentPx >= MEDIUM_TOP_MIN) return ANCHOR_K_MEDIUM;
         return 0.0f;
@@ -325,8 +338,9 @@ namespace banner_256
         if (safeRaise > 0 && !state->loggedRaise)
         {
             darkomen::detour::trace(
-                "Stage10 anchorRaiseK unit=%08lX top=%.1f W=%.6f K=%.1f raise=%d",
-                unit, state->topExtentPx, w, anchorK, safeRaise);
+                "Stage11 anchorRaiseK unit=%08lX resource=%lux%lu top=%.1f W=%.6f K=%.1f raise=%d",
+                unit, state->resourceWidth, state->resourceHeight,
+                state->topExtentPx, w, anchorK, safeRaise);
             FlushTrace();
             state->loggedRaise = TRUE;
         }
@@ -340,7 +354,6 @@ namespace banner_256
             NULL, 0x200, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (g_caves == NULL) return FALSE;
 
-        // Hook A: classify the winning body resource template.
         BYTE* a = g_caves + 0x00;
         DWORD n = 0;
         a[n++] = 0x60;
@@ -356,7 +369,6 @@ namespace banner_256
         WriteRel32(a + callA, (DWORD)&MarkUnitClass);
         WriteRel32(a + jumpA, RETURN_CLASSIFY);
 
-        // Hook C: retain the proven body-entry -> live-unit association.
         BYTE* c = g_caves + 0x40;
         n = 0;
         c[n++] = 0xC7; c[n++] = 0x45; c[n++] = 0x10;
@@ -372,7 +384,6 @@ namespace banner_256
         WriteRel32(c + callC, (DWORD)&RecordEntryUnit);
         WriteRel32(c + jumpC, RETURN_ENTRY);
 
-        // Hook D: inspect the associated body frame and recover native top extent.
         BYTE* d = g_caves + 0x80;
         n = 0;
         d[n++] = 0x57; d[n++] = 0x55;
@@ -385,7 +396,6 @@ namespace banner_256
         WriteRel32(d + callD, (DWORD)&CaptureBodyTopExtent);
         WriteRel32(d + jumpD, RETURN_RENDER);
 
-        // Hook B: replay vanilla anchor calculation and subtract the tiered raise.
         BYTE* b = g_caves + 0xC0;
         n = 0;
         b[n++] = 0xA1; *((DWORD*)(b + n)) = 0x00503714; n += 4;
@@ -403,7 +413,6 @@ namespace banner_256
         WriteRel32(b + callB, (DWORD)&GetUnitAnchorRaise);
         WriteRel32(b + jumpB, RETURN_ANCHOR);
 
-        // Hook E: completed homogeneous W, alternate projection branch 1.
         BYTE* e = g_caves + 0x100;
         n = 0;
         e[n++] = 0xD9; e[n++] = 0x15;
@@ -418,7 +427,6 @@ namespace banner_256
         WriteRel32(e + callE, (DWORD)&RecordProjectionW);
         WriteRel32(e + jumpE, RETURN_PROJECTION_E);
 
-        // Hook F: completed homogeneous W, alternate projection branch 2.
         BYTE* f = g_caves + 0x140;
         n = 0;
         f[n++] = 0xD9; f[n++] = 0x15;
@@ -434,7 +442,6 @@ namespace banner_256
         WriteRel32(f + callF, (DWORD)&RecordProjectionW);
         WriteRel32(f + jumpF, RETURN_PROJECTION_F);
 
-        // Hook G: ESI is the true computeUnitScreenBounds unit.
         BYTE* g = g_caves + 0x180;
         n = 0;
         g[n++] = 0x89; g[n++] = 0x35;
@@ -460,7 +467,7 @@ namespace banner_256
             !BytesEqual(HOOK_PROJECTION_G, kOriginalProjectionG, sizeof(kOriginalProjectionG)) ||
             !BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)))
         {
-            darkomen::detour::trace("Stage10 install FAIL byte guard");
+            darkomen::detour::trace("Stage11 install FAIL byte guard");
             FlushTrace();
             return;
         }
@@ -486,7 +493,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage10 installed: tiered 256 banner correction active (medium K=650, large K=1900)");
+            "Stage11 installed: 128x256 medium/large + 256x256 large banner correction active");
         FlushTrace();
     }
 
