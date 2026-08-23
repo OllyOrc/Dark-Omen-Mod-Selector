@@ -1,12 +1,12 @@
-// Stage11: tiered banner positioning for enlarged sprite resource classes.
+// Stage11: zoom-aware banner positioning driven by the measured body frame.
 //
-// Original-sized sprites keep vanilla overlay / interaction placement. The new
-// 128x256 class provides a true intermediate resource bucket for moderately
-// enlarged tall sprites, while 256x256 remains available for the largest units.
-// Hooks C/D recover each body's native top extent so 128x256 sprites can still
-// choose medium (K=650) or large (K=1900) banner spacing from their real height.
-// Hooks E/F/G capture homogeneous W for zoom scaling. Hook B applies the shared
-// overlay / interaction correction.
+// The resource selector can report 128x128 even for a moderately enlarged body
+// (the 133% Troll is the proven case). Therefore banner placement must not rely
+// on the winning template alone. Hooks C/D recover the actual native body height
+// and top extent from the frame record. Original bodies whose native height is
+// <=128 stay completely vanilla; moderately enlarged bodies use K=650; genuinely
+// large bodies use the proven K=1900. Hooks E/F/G provide homogeneous W for zoom
+// scaling and Hook B applies the shared overlay / interaction correction.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -50,12 +50,14 @@ namespace banner_256
     static const float ANCHOR_K_LARGE  = 1900.0f;
     static const float MEDIUM_TOP_MIN   = 130.0f;
     static const float LARGE_TOP_MIN    = 180.0f;
+    static const float VANILLA_HEIGHT_MAX = 128.0f;
 
     struct UNIT_STATE
     {
         DWORD unit;
         DWORD resourceWidth;
         DWORD resourceHeight;
+        float bodyHeightPx;
         float topExtentPx;
         BOOL loggedClass;
         BOOL loggedSuppressedSmaller;
@@ -82,7 +84,6 @@ namespace banner_256
     static volatile DWORD g_lastProjectionUnit = 0;
     static volatile DWORD g_lastProjectionWBits = 0;
     static volatile DWORD g_projectionSequence = 0;
-    static volatile DWORD g_classifyDiagnosticCount = 0;
 
     static void FlushTrace()
     {
@@ -107,14 +108,6 @@ namespace banner_256
         p[0] = 0xE9;
         *((DWORD*)(p + 1)) = target - (address + 5);
         for (BYTE i = 5; i < overwritten_size; ++i) p[i] = 0x90;
-    }
-
-    static UNIT_STATE* FindUnitState(DWORD unit)
-    {
-        if (unit == 0) return NULL;
-        for (DWORD i = 0; i < _countof(g_units); ++i)
-            if (g_units[i].unit == unit) return &g_units[i];
-        return NULL;
     }
 
     static UNIT_STATE* FindOrCreateUnitState(DWORD unit)
@@ -148,27 +141,13 @@ namespace banner_256
         const DWORD height = *((DWORD*)(templateEntry + 0x1C));
         const BOOL extendedTall = IsExtendedTallClass(width, height);
 
-        // Temporary selector diagnostic: unlike the normal Stage11 messages,
-        // this deliberately records the actual winning template on every early
-        // body-resource pass. It is capped so the trace cannot grow unbounded.
-        if (g_classifyDiagnosticCount < 160)
-        {
-            ++g_classifyDiagnosticCount;
-            darkomen::detour::trace(
-                "Stage11 selectorWin #%lu unit=%08lX template=%08lX width=%lu height=%lu extended=%lu",
-                g_classifyDiagnosticCount, unit, templateEntry, width, height,
-                extendedTall ? 1UL : 0UL);
-            FlushTrace();
-        }
-
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state == NULL) return;
 
-        // A positive 128x256/256x256 body classification is sticky. Later
-        // auxiliary passes may use 128x128 and must not demote the live unit.
+        // Keep a positive extended class sticky because later auxiliary passes
+        // can legitimately report a smaller template for the same live unit.
         if (extendedTall)
         {
-            // Prefer 256x256 if both extended classes are ever seen.
             if (state->resourceHeight != 256 || width > state->resourceWidth)
             {
                 state->resourceWidth = width;
@@ -258,28 +237,45 @@ namespace banner_256
         if (frameScale < 0.0f) frameScale = -frameScale;
         if (yOffsetRatio < 0.0f) yOffsetRatio = -yOffsetRatio;
 
+        // Use the winning template height only as the backing-surface size.
+        // Crucially, allow nativeHeight to exceed 128: the 133% Troll proves
+        // the selector can still report 128x128 while its body is taller.
         const float backingHeight = (state->resourceHeight == 256) ? 256.0f :
                                     ((state->resourceHeight == 128) ? 128.0f : 0.0f);
         if (backingHeight <= 0.0f) return;
 
         const float nativeHeight = frameScale * backingHeight;
         const float topExtent = yOffsetRatio * nativeHeight;
+        if (!(nativeHeight > 0.0f && nativeHeight < 1024.0f)) return;
         if (!(topExtent > 0.0f && topExtent < 1024.0f)) return;
 
+        BOOL changed = FALSE;
+        if (nativeHeight > state->bodyHeightPx)
+        {
+            state->bodyHeightPx = nativeHeight;
+            changed = TRUE;
+        }
         if (topExtent > state->topExtentPx)
         {
             state->topExtentPx = topExtent;
-            state->loggedRaise = FALSE;
+            changed = TRUE;
         }
+        if (changed)
+            state->loggedRaise = FALSE;
 
-        if (!state->loggedExtent && state->resourceHeight == 256)
+        if (!state->loggedExtent)
         {
-            const char* tier = (state->topExtentPx >= LARGE_TOP_MIN) ? "large" :
-                               ((state->topExtentPx >= MEDIUM_TOP_MIN) ? "medium" : "vanilla");
+            const char* tier = "vanilla";
+            if (state->bodyHeightPx > VANILLA_HEIGHT_MAX)
+            {
+                tier = (state->topExtentPx >= LARGE_TOP_MIN) ? "large" :
+                       ((state->topExtentPx >= MEDIUM_TOP_MIN) ? "medium" : "vanilla");
+            }
+
             darkomen::detour::trace(
-                "Stage11 bodyExtent unit=%08lX resource=%lux%lu top=%.1f frameH=%.1f tier=%s",
+                "Stage11 bodyExtent unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f tier=%s",
                 unit, state->resourceWidth, state->resourceHeight,
-                state->topExtentPx, nativeHeight, tier);
+                state->bodyHeightPx, state->topExtentPx, tier);
             FlushTrace();
             state->loggedExtent = TRUE;
         }
@@ -288,7 +284,6 @@ namespace banner_256
     static void __cdecl PublishProjectionSample(DWORD ignoredUnit)
     {
         (void)ignoredUnit;
-
         const DWORD bits = g_projectionWScratchBits;
         const DWORD owner = g_currentProjectionUnit;
         if (bits == 0 || owner == 0) return;
@@ -305,10 +300,22 @@ namespace banner_256
 
     static float GetAnchorK(const UNIT_STATE* state)
     {
-        if (state == NULL || state->resourceHeight != 256) return 0.0f;
+        if (state == NULL) return 0.0f;
 
+        // Proven full extended resources retain their tested fallback while the
+        // frame measurement is arriving.
         if (state->topExtentPx <= 0.0f)
-            return (state->resourceWidth == 128) ? ANCHOR_K_MEDIUM : ANCHOR_K_LARGE;
+        {
+            if (state->resourceHeight == 256)
+                return (state->resourceWidth == 128) ? ANCHOR_K_MEDIUM : ANCHOR_K_LARGE;
+            return 0.0f;
+        }
+
+        // This is the key Stage11 change: the measured native body height can
+        // promote a nominal 128x128 winner into the medium/large banner tier.
+        // Genuine <=128-pixel bodies remain vanilla regardless of origin.
+        if (state->bodyHeightPx <= VANILLA_HEIGHT_MAX)
+            return 0.0f;
 
         if (state->topExtentPx >= LARGE_TOP_MIN) return ANCHOR_K_LARGE;
         if (state->topExtentPx >= MEDIUM_TOP_MIN) return ANCHOR_K_MEDIUM;
@@ -347,9 +354,9 @@ namespace banner_256
         if (safeRaise > 0 && !state->loggedRaise)
         {
             darkomen::detour::trace(
-                "Stage11 anchorRaiseK unit=%08lX resource=%lux%lu top=%.1f W=%.6f K=%.1f raise=%d",
+                "Stage11 anchorRaiseK unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f W=%.6f K=%.1f raise=%d",
                 unit, state->resourceWidth, state->resourceHeight,
-                state->topExtentPx, w, anchorK, safeRaise);
+                state->bodyHeightPx, state->topExtentPx, w, anchorK, safeRaise);
             FlushTrace();
             state->loggedRaise = TRUE;
         }
@@ -488,7 +495,6 @@ namespace banner_256
         g_lastProjectionUnit = 0;
         g_lastProjectionWBits = 0;
         g_projectionSequence = 0;
-        g_classifyDiagnosticCount = 0;
 
         if (!BuildCaves()) return;
 
@@ -503,7 +509,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: selector diagnostic + 128x256/256x256 banner tiers active");
+            "Stage11 installed: measured-body banner tiers active (K=650 / K=1900)");
         FlushTrace();
     }
 
@@ -531,7 +537,6 @@ namespace banner_256
         g_lastProjectionUnit = 0;
         g_lastProjectionWBits = 0;
         g_projectionSequence = 0;
-        g_classifyDiagnosticCount = 0;
         g_loaded = FALSE;
     }
 }
