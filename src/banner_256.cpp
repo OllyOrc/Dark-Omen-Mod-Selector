@@ -6,16 +6,15 @@
 // dimensions directly. We calibrate once from the first valid body frame for a
 // live unit and use a three-point continuous curve through the proven 133%-Troll
 // point (top~=113, K=650), the ~202px Troll point (top~=150, K=1100), and the
-// full-size point (top~=165+, K=1800). This prevents ~202px sprites from sitting
-// almost at the full 256 banner height while preserving smooth interpolation for
-// arbitrary enlarged sprites. Hooks E/F/G provide homogeneous W for zoom scaling
-// and Hook B applies the shared overlay / interaction correction.
+// full-size point (top~=165+, K=1800).
 //
-// Current diagnostic: dump the sprite-owner layout once per unit so we can find
-// the native frame-count field and pre-scan the complete sprite envelope at first
-// sight. That will let enlarged 128x128 winners receive their correct cached K
-// immediately instead of waiting for a later facing/camera pass to expose a tall
-// frame. The diagnostic is temporary and will be removed from the shipping build.
+// Important timing fix: computeUnitScreenBounds can run before the body/resource
+// pass has identified an enlarged Troll. Dark Omen may then keep the old cached
+// unit+0x6C banner anchor until the camera changes. As soon as the body/resource
+// pass discovers a better K, we now repair that cached Y anchor by the delta
+// between the old and new raise. The next normal bounds pass still uses Hook B,
+// so this does not accumulate and camera movement is no longer required to make
+// an already-visible enlarged unit adopt its corrected banner height.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -59,16 +58,10 @@ namespace banner_256
     static const float ANCHOR_K_MID    = 1100.0f;
     static const float ANCHOR_K_LARGE  = 1800.0f;
 
-    // Three-point calibration from the test Trolls:
-    // ~152px source -> proxy top~=113 -> K=650
-    // ~202px source -> proxy top~=150 -> K=1100
-    // ~228px+ source -> proxy top~=165+ -> K=1800
     static const float CONTINUOUS_TOP_MEDIUM = 113.0f;
     static const float CONTINUOUS_TOP_MID    = 150.0f;
     static const float CONTINUOUS_TOP_LARGE  = 165.0f;
 
-    // Conservative guard for nominal 128x128 winners. This is the proven
-    // enlarged 133%-Troll envelope and keeps ordinary original units vanilla.
     static const float MEDIUM_BODY_MIN = 99.0f;
     static const float MEDIUM_TOP_MIN  = 110.0f;
 
@@ -87,6 +80,8 @@ namespace banner_256
         BOOL loggedRaise;
         BOOL loggedRawFrame;
         BOOL loggedOwner;
+        BOOL loggedImmediatePatch;
+        int lastAppliedRaise;
         DWORD projectionWBits;
         DWORD projectionSequence;
     };
@@ -108,6 +103,9 @@ namespace banner_256
     static volatile DWORD g_lastProjectionUnit = 0;
     static volatile DWORD g_lastProjectionWBits = 0;
     static volatile DWORD g_projectionSequence = 0;
+
+    static float GetAnchorK(const UNIT_STATE* state);
+    static void RefreshCachedAnchor(UNIT_STATE* state);
 
     static void FlushTrace()
     {
@@ -182,6 +180,7 @@ namespace banner_256
                 state->loggedRaise = FALSE;
                 state->loggedRawFrame = FALSE;
                 state->loggedOwner = FALSE;
+                state->loggedImmediatePatch = FALSE;
             }
 
             if (!state->loggedClass)
@@ -192,6 +191,8 @@ namespace banner_256
                 FlushTrace();
                 state->loggedClass = TRUE;
             }
+
+            RefreshCachedAnchor(state);
             return;
         }
 
@@ -303,14 +304,12 @@ namespace banner_256
         if (!(nativeHeight > 0.0f && nativeHeight < 1024.0f)) return;
         if (!(topExtent > 0.0f && topExtent < 1024.0f)) return;
 
-        // Calibrate once from the first valid body frame. Later animation/body
-        // passes can have very different extents, which must not make the banner
-        // jump while the unit animates.
         if (!state->hasCalibrationTop)
         {
             state->calibrationTopPx = topExtent;
             state->hasCalibrationTop = TRUE;
             state->loggedRaise = FALSE;
+            state->loggedImmediatePatch = FALSE;
         }
 
         if (nativeHeight > state->bodyHeightPx)
@@ -327,6 +326,8 @@ namespace banner_256
             FlushTrace();
             state->loggedExtent = TRUE;
         }
+
+        RefreshCachedAnchor(state);
     }
 
     static void __cdecl PublishProjectionSample(DWORD ignoredUnit)
@@ -376,13 +377,9 @@ namespace banner_256
     {
         if (state == NULL) return 0.0f;
 
-        // A true 256x256 winner remains the proven full-size path.
         if (state->resourceHeight == 256 && state->resourceWidth == 256)
             return ANCHOR_K_LARGE;
 
-        // 128x256 is the physical bucket for intermediate/tall sprites. Before
-        // the first body frame is seen, use the safe K=650 fallback; afterward
-        // use the continuous three-point calibration curve.
         if (state->resourceHeight == 256 && state->resourceWidth == 128)
         {
             if (!state->hasCalibrationTop)
@@ -390,8 +387,6 @@ namespace banner_256
             return ContinuousAnchorK(state->calibrationTopPx);
         }
 
-        // Some enlarged sprites (the proven 133% Troll) can still win 128x128.
-        // Promote only the conservative enlarged-body envelope.
         if (state->resourceHeight == 128 &&
             state->bodyHeightPx >= MEDIUM_BODY_MIN &&
             state->topExtentPx >= MEDIUM_TOP_MIN)
@@ -402,6 +397,59 @@ namespace banner_256
         }
 
         return 0.0f;
+    }
+
+    static int CalculateRaise(const UNIT_STATE* state)
+    {
+        if (state == NULL || state->projectionWBits == 0)
+            return 0;
+
+        const float anchorK = GetAnchorK(state);
+        if (anchorK <= 0.0f)
+            return 0;
+
+        union FLOAT_BITS { DWORD bits; float value; } wBits;
+        wBits.bits = state->projectionWBits;
+
+        const float w = wBits.value;
+        const float absW = (w < 0.0f) ? -w : w;
+        if (!(absW > 0.0001f && absW < 1000000.0f))
+            return 0;
+
+        const int raise = (int)((anchorK / absW) + 0.5f);
+        return (raise > 0 && raise < 1024) ? raise : 0;
+    }
+
+    static void RefreshCachedAnchor(UNIT_STATE* state)
+    {
+        if (state == NULL || state->unit == 0)
+            return;
+
+        const int desiredRaise = CalculateRaise(state);
+        if (desiredRaise <= 0)
+            return;
+
+        const int delta = desiredRaise - state->lastAppliedRaise;
+        if (delta == 0)
+            return;
+
+        LONG* cachedY = (LONG*)(state->unit + 0x6C);
+        const LONG before = *cachedY;
+        if (before < -8192 || before > 8192)
+            return;
+
+        *cachedY = before - delta;
+        state->lastAppliedRaise = desiredRaise;
+
+        if (!state->loggedImmediatePatch)
+        {
+            darkomen::detour::trace(
+                "Stage11 immediateAnchorPatch unit=%08lX oldRaise=%d newRaise=%d delta=%d y=%ld->%ld",
+                state->unit, desiredRaise - delta, desiredRaise, delta,
+                before, *cachedY);
+            FlushTrace();
+            state->loggedImmediatePatch = TRUE;
+        }
     }
 
     static int __cdecl GetUnitAnchorRaise(DWORD unit)
@@ -420,7 +468,10 @@ namespace banner_256
 
         const float anchorK = GetAnchorK(state);
         if (anchorK <= 0.0f || state->projectionWBits == 0)
+        {
+            state->lastAppliedRaise = 0;
             return 0;
+        }
 
         union FLOAT_BITS { DWORD bits; float value; } wBits;
         wBits.bits = state->projectionWBits;
@@ -428,10 +479,14 @@ namespace banner_256
         const float w = wBits.value;
         const float absW = (w < 0.0f) ? -w : w;
         if (!(absW > 0.0001f && absW < 1000000.0f))
+        {
+            state->lastAppliedRaise = 0;
             return 0;
+        }
 
         const int raise = (int)((anchorK / absW) + 0.5f);
         const int safeRaise = (raise > 0 && raise < 1024) ? raise : 0;
+        state->lastAppliedRaise = safeRaise;
 
         if (safeRaise > 0 && !state->loggedRaise)
         {
@@ -592,7 +647,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: owner-layout diagnostic + K=650/1100/1800 scaling active");
+            "Stage11 installed: immediate cached-anchor repair + K=650/1100/1800 scaling active");
         FlushTrace();
     }
 
