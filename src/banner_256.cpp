@@ -5,7 +5,7 @@
 // than RDose's literal source dimensions: the proven 133% Troll measured here as
 // bodyH=100/top=113 while RDose reports roughly 63x152 with Y=-154. Therefore we
 // use that runtime proxy to identify the intermediate tier, while preserving the
-// proven 256-resource K=1900 path. This diagnostic build also records the raw
+// proven 256-resource K=1800 path. This diagnostic build also records the raw
 // 0x2C-byte body frame record once per unit so we can locate the native SPR
 // X/Y/width/height values and replace the proxy heuristic with true continuous
 // native-size scaling. Hooks E/F/G provide homogeneous W for zoom scaling and
@@ -50,7 +50,7 @@ namespace banner_256
         { 0xA1,0x14,0x37,0x50,0x00,0x2B,0xC2 };
 
     static const float ANCHOR_K_MEDIUM = 650.0f;
-    static const float ANCHOR_K_LARGE  = 1900.0f;
+    static const float ANCHOR_K_LARGE  = 1800.0f;
 
     // Runtime proxy thresholds calibrated from the 133% Troll trace:
     // bodyH=100/top=113. The second nominal 128x128 sample was bodyH=98/top=101.
@@ -521,7 +521,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: native-frame record diagnostic + existing K=650/K=1900 active");
+            "Stage11 installed: native-frame record diagnostic + existing K=650/K=1800 active");
         FlushTrace();
     }
 
