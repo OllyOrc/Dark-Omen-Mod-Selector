@@ -1,11 +1,11 @@
-// Stage11: zoom-aware banner positioning driven by the measured body frame.
+// Stage11: zoom-aware banner positioning with an intermediate enlarged-body tier.
 //
-// The resource selector can report 128x128 even for a moderately enlarged body
-// (the 133% Troll is the proven case). Therefore banner placement must not rely
-// on the winning template alone. Hooks C/D recover the actual native body height
-// and top extent from the frame record. Original bodies whose native height is
-// <=128 stay completely vanilla; moderately enlarged bodies use K=650; genuinely
-// large bodies use the proven K=1900. Hooks E/F/G provide homogeneous W for zoom
+// Dark Omen can report a 133%-scaled Troll as a 128x128 winner even though it
+// is visibly larger. The frame record also reports a render-space proxy rather
+// than RDose's literal source dimensions: the proven 133% Troll measured here as
+// bodyH=100/top=113 while RDose reports roughly 63x152 with Y=-154. Therefore we
+// use that runtime proxy to identify the intermediate tier, while preserving the
+// proven 256-resource K=1900 path. Hooks E/F/G provide homogeneous W for zoom
 // scaling and Hook B applies the shared overlay / interaction correction.
 #include "header.h"
 #include "detour.h"
@@ -48,9 +48,14 @@ namespace banner_256
 
     static const float ANCHOR_K_MEDIUM = 650.0f;
     static const float ANCHOR_K_LARGE  = 1900.0f;
-    static const float MEDIUM_TOP_MIN   = 130.0f;
-    static const float LARGE_TOP_MIN    = 180.0f;
-    static const float VANILLA_HEIGHT_MAX = 128.0f;
+
+    // Runtime proxy thresholds calibrated from the 133% Troll trace:
+    // bodyH=100/top=113.  The second nominal 128x128 sample was bodyH=98/top=101,
+    // so requiring both conditions separates the enlarged body from that smaller
+    // pass while remaining conservative for original content.
+    static const float MEDIUM_BODY_MIN = 99.0f;
+    static const float MEDIUM_TOP_MIN  = 110.0f;
+    static const float LARGE_TOP_MIN   = 150.0f;
 
     struct UNIT_STATE
     {
@@ -237,13 +242,12 @@ namespace banner_256
         if (frameScale < 0.0f) frameScale = -frameScale;
         if (yOffsetRatio < 0.0f) yOffsetRatio = -yOffsetRatio;
 
-        // Use the winning template height only as the backing-surface size.
-        // Crucially, allow nativeHeight to exceed 128: the 133% Troll proves
-        // the selector can still report 128x128 while its body is taller.
         const float backingHeight = (state->resourceHeight == 256) ? 256.0f :
                                     ((state->resourceHeight == 128) ? 128.0f : 0.0f);
         if (backingHeight <= 0.0f) return;
 
+        // These are render-space proxies, not literal RDose dimensions.  They
+        // are still stable enough to distinguish the observed intermediate body.
         const float nativeHeight = frameScale * backingHeight;
         const float topExtent = yOffsetRatio * nativeHeight;
         if (!(nativeHeight > 0.0f && nativeHeight < 1024.0f)) return;
@@ -266,14 +270,13 @@ namespace banner_256
         if (!state->loggedExtent)
         {
             const char* tier = "vanilla";
-            if (state->bodyHeightPx > VANILLA_HEIGHT_MAX)
-            {
-                tier = (state->topExtentPx >= LARGE_TOP_MIN) ? "large" :
-                       ((state->topExtentPx >= MEDIUM_TOP_MIN) ? "medium" : "vanilla");
-            }
+            if (state->resourceHeight == 256)
+                tier = (state->topExtentPx >= LARGE_TOP_MIN) ? "large" : "medium";
+            else if (state->bodyHeightPx >= MEDIUM_BODY_MIN && state->topExtentPx >= MEDIUM_TOP_MIN)
+                tier = "medium";
 
             darkomen::detour::trace(
-                "Stage11 bodyExtent unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f tier=%s",
+                "Stage11 bodyProxy unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f tier=%s",
                 unit, state->resourceWidth, state->resourceHeight,
                 state->bodyHeightPx, state->topExtentPx, tier);
             FlushTrace();
@@ -302,23 +305,22 @@ namespace banner_256
     {
         if (state == NULL) return 0.0f;
 
-        // Proven full extended resources retain their tested fallback while the
-        // frame measurement is arriving.
-        if (state->topExtentPx <= 0.0f)
+        // Keep the proven full-size path independent of the proxy threshold.
+        if (state->resourceHeight == 256)
         {
-            if (state->resourceHeight == 256)
-                return (state->resourceWidth == 128) ? ANCHOR_K_MEDIUM : ANCHOR_K_LARGE;
-            return 0.0f;
+            if (state->resourceWidth == 256) return ANCHOR_K_LARGE;
+            if (state->topExtentPx >= LARGE_TOP_MIN) return ANCHOR_K_LARGE;
+            return ANCHOR_K_MEDIUM;
         }
 
-        // This is the key Stage11 change: the measured native body height can
-        // promote a nominal 128x128 winner into the medium/large banner tier.
-        // Genuine <=128-pixel bodies remain vanilla regardless of origin.
-        if (state->bodyHeightPx <= VANILLA_HEIGHT_MAX)
-            return 0.0f;
+        // Nominal 128x128 winners are promoted only when BOTH measured proxy
+        // values match the enlarged-body envelope. This is intentionally narrow
+        // so ordinary original 128x128 units remain vanilla.
+        if (state->resourceHeight == 128 &&
+            state->bodyHeightPx >= MEDIUM_BODY_MIN &&
+            state->topExtentPx >= MEDIUM_TOP_MIN)
+            return ANCHOR_K_MEDIUM;
 
-        if (state->topExtentPx >= LARGE_TOP_MIN) return ANCHOR_K_LARGE;
-        if (state->topExtentPx >= MEDIUM_TOP_MIN) return ANCHOR_K_MEDIUM;
         return 0.0f;
     }
 
@@ -509,7 +511,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: measured-body banner tiers active (K=650 / K=1900)");
+            "Stage11 installed: calibrated medium proxy K=650 + full K=1900 active");
         FlushTrace();
     }
 
