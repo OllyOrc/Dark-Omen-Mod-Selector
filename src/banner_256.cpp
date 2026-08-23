@@ -4,12 +4,12 @@
 // added 128x256 resource bucket. The render frame record provides a stable
 // per-body top-extent proxy even though it does not expose RDose's literal source
 // dimensions directly. We calibrate once from the first valid body frame for a
-// live unit and continuously interpolate the banner correction between the
-// proven 133%-Troll point (top~=113, K=650) and the full-size point
-// (top~=165+, K=1800). This prevents ~202px sprites from jumping straight to the
-// maximum correction while preserving vanilla original units and the proven
-// 256x256 full-size path. Hooks E/F/G provide homogeneous W for zoom scaling and
-// Hook B applies the shared overlay / interaction correction.
+// live unit and use a three-point continuous curve through the proven 133%-Troll
+// point (top~=113, K=650), the ~202px Troll point (top~=150, K=1100), and the
+// full-size point (top~=165+, K=1800). This prevents ~202px sprites from sitting
+// almost at the full 256 banner height while preserving smooth interpolation for
+// arbitrary enlarged sprites. Hooks E/F/G provide homogeneous W for zoom scaling
+// and Hook B applies the shared overlay / interaction correction.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -50,12 +50,15 @@ namespace banner_256
         { 0xA1,0x14,0x37,0x50,0x00,0x2B,0xC2 };
 
     static const float ANCHOR_K_MEDIUM = 650.0f;
+    static const float ANCHOR_K_MID    = 1100.0f;
     static const float ANCHOR_K_LARGE  = 1800.0f;
 
-    // The 133%-scaled Troll measured top~=113 and looks correct at K=650.
-    // The ~202px Troll measured top~=150, which interpolates to ~1468 rather
-    // than jumping to the maximum. Full-size sprites reach K=1800 at ~165+.
+    // Three-point calibration from the test Trolls:
+    // ~152px source -> proxy top~=113 -> K=650
+    // ~202px source -> proxy top~=150 -> K=1100
+    // ~228px+ source -> proxy top~=165+ -> K=1800
     static const float CONTINUOUS_TOP_MEDIUM = 113.0f;
+    static const float CONTINUOUS_TOP_MID    = 150.0f;
     static const float CONTINUOUS_TOP_LARGE  = 165.0f;
 
     // Conservative guard for nominal 128x128 winners. This is the proven
@@ -279,9 +282,8 @@ namespace banner_256
         if (!(topExtent > 0.0f && topExtent < 1024.0f)) return;
 
         // Calibrate once from the first valid body frame. Later animation/body
-        // passes can have very different extents (the ~202px Troll later reached
-        // proxy values 160/308), which must not cause the banner to jump between
-        // tiers while the unit animates.
+        // passes can have very different extents, which must not make the banner
+        // jump while the unit animates.
         if (!state->hasCalibrationTop)
         {
             state->calibrationTopPx = topExtent;
@@ -289,19 +291,10 @@ namespace banner_256
             state->loggedRaise = FALSE;
         }
 
-        BOOL changed = FALSE;
         if (nativeHeight > state->bodyHeightPx)
-        {
             state->bodyHeightPx = nativeHeight;
-            changed = TRUE;
-        }
         if (topExtent > state->topExtentPx)
-        {
             state->topExtentPx = topExtent;
-            changed = TRUE;
-        }
-        if (changed && !state->hasCalibrationTop)
-            state->loggedRaise = FALSE;
 
         if (!state->loggedExtent)
         {
@@ -335,14 +328,26 @@ namespace banner_256
     {
         if (top <= CONTINUOUS_TOP_MEDIUM)
             return ANCHOR_K_MEDIUM;
-        if (top >= CONTINUOUS_TOP_LARGE)
-            return ANCHOR_K_LARGE;
 
-        const float scale =
-            (top - CONTINUOUS_TOP_MEDIUM) /
-            (CONTINUOUS_TOP_LARGE - CONTINUOUS_TOP_MEDIUM);
-        return ANCHOR_K_MEDIUM +
-            scale * (ANCHOR_K_LARGE - ANCHOR_K_MEDIUM);
+        if (top < CONTINUOUS_TOP_MID)
+        {
+            const float scale =
+                (top - CONTINUOUS_TOP_MEDIUM) /
+                (CONTINUOUS_TOP_MID - CONTINUOUS_TOP_MEDIUM);
+            return ANCHOR_K_MEDIUM +
+                scale * (ANCHOR_K_MID - ANCHOR_K_MEDIUM);
+        }
+
+        if (top < CONTINUOUS_TOP_LARGE)
+        {
+            const float scale =
+                (top - CONTINUOUS_TOP_MID) /
+                (CONTINUOUS_TOP_LARGE - CONTINUOUS_TOP_MID);
+            return ANCHOR_K_MID +
+                scale * (ANCHOR_K_LARGE - ANCHOR_K_MID);
+        }
+
+        return ANCHOR_K_LARGE;
     }
 
     static float GetAnchorK(const UNIT_STATE* state)
@@ -355,7 +360,7 @@ namespace banner_256
 
         // 128x256 is the physical bucket for intermediate/tall sprites. Before
         // the first body frame is seen, use the safe K=650 fallback; afterward
-        // continuously interpolate from K=650 to K=1800 using calibrationTop.
+        // use the continuous three-point calibration curve.
         if (state->resourceHeight == 256 && state->resourceWidth == 128)
         {
             if (!state->hasCalibrationTop)
@@ -364,8 +369,7 @@ namespace banner_256
         }
 
         // Some enlarged sprites (the proven 133% Troll) can still win 128x128.
-        // Promote only the conservative enlarged-body envelope, but use the same
-        // continuous function if their measured top grows beyond the medium case.
+        // Promote only the conservative enlarged-body envelope.
         if (state->resourceHeight == 128 &&
             state->bodyHeightPx >= MEDIUM_BODY_MIN &&
             state->topExtentPx >= MEDIUM_TOP_MIN)
@@ -566,7 +570,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: continuous K=650..1800 enlarged-body banner scaling active");
+            "Stage11 installed: three-point continuous K=650/1100/1800 banner scaling active");
         FlushTrace();
     }
 
