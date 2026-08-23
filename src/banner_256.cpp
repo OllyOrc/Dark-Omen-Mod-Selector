@@ -5,8 +5,11 @@
 // than RDose's literal source dimensions: the proven 133% Troll measured here as
 // bodyH=100/top=113 while RDose reports roughly 63x152 with Y=-154. Therefore we
 // use that runtime proxy to identify the intermediate tier, while preserving the
-// proven 256-resource K=1900 path. Hooks E/F/G provide homogeneous W for zoom
-// scaling and Hook B applies the shared overlay / interaction correction.
+// proven 256-resource K=1900 path. This diagnostic build also records the raw
+// 0x2C-byte body frame record once per unit so we can locate the native SPR
+// X/Y/width/height values and replace the proxy heuristic with true continuous
+// native-size scaling. Hooks E/F/G provide homogeneous W for zoom scaling and
+// Hook B applies the shared overlay / interaction correction.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -50,9 +53,7 @@ namespace banner_256
     static const float ANCHOR_K_LARGE  = 1900.0f;
 
     // Runtime proxy thresholds calibrated from the 133% Troll trace:
-    // bodyH=100/top=113.  The second nominal 128x128 sample was bodyH=98/top=101,
-    // so requiring both conditions separates the enlarged body from that smaller
-    // pass while remaining conservative for original content.
+    // bodyH=100/top=113. The second nominal 128x128 sample was bodyH=98/top=101.
     static const float MEDIUM_BODY_MIN = 99.0f;
     static const float MEDIUM_TOP_MIN  = 110.0f;
     static const float LARGE_TOP_MIN   = 150.0f;
@@ -68,6 +69,7 @@ namespace banner_256
         BOOL loggedSuppressedSmaller;
         BOOL loggedExtent;
         BOOL loggedRaise;
+        BOOL loggedRawFrame;
         DWORD projectionWBits;
         DWORD projectionSequence;
     };
@@ -149,8 +151,6 @@ namespace banner_256
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state == NULL) return;
 
-        // Keep a positive extended class sticky because later auxiliary passes
-        // can legitimately report a smaller template for the same live unit.
         if (extendedTall)
         {
             if (state->resourceHeight != 256 || width > state->resourceWidth)
@@ -159,6 +159,7 @@ namespace banner_256
                 state->resourceHeight = height;
                 state->loggedExtent = FALSE;
                 state->loggedRaise = FALSE;
+                state->loggedRawFrame = FALSE;
             }
 
             if (!state->loggedClass)
@@ -237,6 +238,21 @@ namespace banner_256
         if (frameIndex < 0 || frameIndex > 4096) return;
 
         const DWORD frameRecord = frameBase + ((DWORD)frameIndex * 0x2C);
+
+        if (!state->loggedRawFrame)
+        {
+            const DWORD* raw = (const DWORD*)frameRecord;
+            darkomen::detour::trace(
+                "Stage11 frameRaw unit=%08lX resource=%lux%lu frame=%ld rec=%08lX "
+                "d00=%08lX d04=%08lX d08=%08lX d0C=%08lX d10=%08lX d14=%08lX "
+                "d18=%08lX d1C=%08lX d20=%08lX d24=%08lX d28=%08lX",
+                unit, state->resourceWidth, state->resourceHeight, frameIndex, frameRecord,
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5],
+                raw[6], raw[7], raw[8], raw[9], raw[10]);
+            FlushTrace();
+            state->loggedRawFrame = TRUE;
+        }
+
         float frameScale = *((float*)(frameRecord + 0x14));
         float yOffsetRatio = *((float*)(frameRecord + 0x1C));
         if (frameScale < 0.0f) frameScale = -frameScale;
@@ -246,8 +262,6 @@ namespace banner_256
                                     ((state->resourceHeight == 128) ? 128.0f : 0.0f);
         if (backingHeight <= 0.0f) return;
 
-        // These are render-space proxies, not literal RDose dimensions.  They
-        // are still stable enough to distinguish the observed intermediate body.
         const float nativeHeight = frameScale * backingHeight;
         const float topExtent = yOffsetRatio * nativeHeight;
         if (!(nativeHeight > 0.0f && nativeHeight < 1024.0f)) return;
@@ -305,7 +319,6 @@ namespace banner_256
     {
         if (state == NULL) return 0.0f;
 
-        // Keep the proven full-size path independent of the proxy threshold.
         if (state->resourceHeight == 256)
         {
             if (state->resourceWidth == 256) return ANCHOR_K_LARGE;
@@ -313,9 +326,6 @@ namespace banner_256
             return ANCHOR_K_MEDIUM;
         }
 
-        // Nominal 128x128 winners are promoted only when BOTH measured proxy
-        // values match the enlarged-body envelope. This is intentionally narrow
-        // so ordinary original 128x128 units remain vanilla.
         if (state->resourceHeight == 128 &&
             state->bodyHeightPx >= MEDIUM_BODY_MIN &&
             state->topExtentPx >= MEDIUM_TOP_MIN)
@@ -511,7 +521,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: calibrated medium proxy K=650 + full K=1900 active");
+            "Stage11 installed: native-frame record diagnostic + existing K=650/K=1900 active");
         FlushTrace();
     }
 
