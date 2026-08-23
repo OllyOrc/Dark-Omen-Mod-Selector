@@ -3,8 +3,8 @@
 // This module ports the already-tested EngRel changes into darkpatch.dll so
 // the on-disk EngRel.exe does not need to be modified:
 //   * Stage4H: full 8-bit/256-colour sprite path.
-//   * Stage8E: keep the original 128x128 resource class and ADD 256x256 as
-//              a sixth resource class.
+//   * Stage8E/11: keep the original classes, add 128x256 for moderately tall
+//                 sprites, and retain 256x256 for the largest sprites.
 //
 // IMPORTANT: the Stage4H code payload below is copied byte-for-byte from the
 // tested Stage4H executable, then its external rel32 branches are relocated to
@@ -24,7 +24,6 @@ namespace sprite_256
     static DWORD* g_table = NULL;
     static BOOL g_loaded = FALSE;
 
-    // Exact Stage4H .spr8 payload (VA 0x005A7000 in the test executable).
     static const BYTE kSpr8Code[CODE_SIZE] =
     {
 #include "sprite_256_payload_0.inc"
@@ -36,12 +35,10 @@ namespace sprite_256
 
     struct REL32_FIXUP
     {
-        DWORD offset;       // offset of E8/E9 opcode inside kSpr8Code
-        DWORD target;       // absolute EngRel target address
+        DWORD offset;
+        DWORD target;
     };
 
-    // External CALL/JMP targets in the Stage4H payload. Branches whose targets
-    // remain inside the copied 0x800-byte payload require no relocation.
     static const REL32_FIXUP kRel32Fixups[] =
     {
         { 0x010, 0x004486BA },
@@ -77,8 +74,6 @@ namespace sprite_256
         BYTE original[7];
     };
 
-    // These are the nine Stage4H redirections. The original bytes are checked
-    // first so darkpatch never blindly patches a different EngRel build.
     static const HOOK_SITE kHookSites[] =
     {
         { 0x0044244E, 6, 0x600, { 0x8B,0x47,0x18,0x8B,0x4E,0x30,0x00 } },
@@ -92,15 +87,18 @@ namespace sprite_256
         { 0x00448800, 5, 0x380, { 0xE8,0x9B,0xEF,0xFF,0xFF,0x00,0x00 } },
     };
 
-    // Stage8E table. Ten DWORDs per row, 0x28-byte stride. The initializer at
-    // 0x004428F0 mutates fields in these records, so this table MUST be writable.
-    static const DWORD kResourceTemplates[6][10] =
+    // Ten DWORDs per row, 0x28-byte stride. Keep rows ordered from smaller to
+    // larger fits so a 63x152-style frame can resolve to 128x256 before 256x256.
+    // The engine already supports rectangular resource classes (32x64/64x32),
+    // so 128x256 follows the same power-of-two pattern.
+    static const DWORD kResourceTemplates[7][10] =
     {
         { 400, 30, 50,  32,  32, 4, 0, 0, 0, 0 },
         { 400, 30, 50,  32,  64, 4, 0, 0, 0, 0 },
         { 400, 30, 50,  64,  32, 4, 0, 0, 0, 0 },
         { 400, 30, 50,  64,  64, 4, 0, 0, 0, 0 },
         { 400, 10, 20, 128, 128, 4, 0, 0, 0, 0 },
+        { 400, 10, 20, 128, 256, 4, 0, 0, 0, 0 },
         { 400, 10, 20, 256, 256, 4, 0, 0, 0, 0 },
     };
 
@@ -111,8 +109,6 @@ namespace sprite_256
 
     static void WriteRel32(BYTE* instruction, DWORD target)
     {
-        // instruction[0] is E8/E9. Relative displacement is from the byte after
-        // the 5-byte instruction. DWORD arithmetic is correct for 32-bit x86.
         DWORD src_after = (DWORD)instruction + 5;
         *((DWORD*)(instruction + 1)) = target - src_after;
     }
@@ -137,17 +133,17 @@ namespace sprite_256
             }
         }
 
-        const BYTE count_original[2] = { 0x6A, 0x05 };             // push 5
-        const BYTE table_original[5] = { 0x68, 0xF8, 0x6D, 0x4D, 0x00 }; // push 004D6DF8
+        const BYTE count_original[2] = { 0x6A, 0x05 };
+        const BYTE table_original[5] = { 0x68, 0xF8, 0x6D, 0x4D, 0x00 };
 
         if (!BytesEqual(0x0042B685, count_original, sizeof(count_original)))
         {
-            Log("sprite_256: EngRel mismatch at 0x0042B685; 256x256 class not installed");
+            Log("sprite_256: EngRel mismatch at 0x0042B685; extended classes not installed");
             return FALSE;
         }
         if (!BytesEqual(0x0042B68C, table_original, sizeof(table_original)))
         {
-            Log("sprite_256: EngRel mismatch at 0x0042B68C; 256x256 class not installed");
+            Log("sprite_256: EngRel mismatch at 0x0042B68C; extended classes not installed");
             return FALSE;
         }
         return TRUE;
@@ -163,8 +159,6 @@ namespace sprite_256
             return;
         }
 
-        // One allocation holds executable Stage4H code plus the writable Stage8E
-        // table. This avoids adding sections to EngRel.exe on disk.
         g_block = (BYTE*)VirtualAlloc(NULL, BLOCK_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (g_block == NULL)
         {
@@ -178,7 +172,6 @@ namespace sprite_256
         memcpy(g_code, kSpr8Code, CODE_SIZE);
         memcpy(g_table, kResourceTemplates, sizeof(kResourceTemplates));
 
-        // Relocate only branches/calls leaving the copied Stage4H block.
         for (DWORD i = 0; i < _countof(kRel32Fixups); ++i)
         {
             const REL32_FIXUP& f = kRel32Fixups[i];
@@ -194,23 +187,22 @@ namespace sprite_256
             WriteRel32(op, f.target);
         }
 
-        // Install Stage4H jumps into the runtime copy.
         for (DWORD i = 0; i < _countof(kHookSites); ++i)
         {
             const HOOK_SITE& s = kHookSites[i];
             WriteJump(s.address, (DWORD)(g_code + s.code_offset), s.size);
         }
 
-        // Stage8E: manager/template count 5 -> 6 and source table -> writable
-        // runtime copy. Do not change the original 128x128 class.
-        *((BYTE*)0x0042B686) = 0x06;
+        // Original manager count is five. We now expose seven rows:
+        // original five + 128x256 + 256x256.
+        *((BYTE*)0x0042B686) = 0x07;
         *((DWORD*)0x0042B68D) = (DWORD)g_table;
 
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
         g_loaded = TRUE;
 
-        Log("sprite_256: installed Stage4H 256-colour path + Stage8E 256x256 resource class");
-        Log("sprite_256: runtime code=%08X table=%08X; classes=32x32,32x64,64x32,64x64,128x128,256x256",
+        Log("sprite_256: installed 256-colour path + 128x256/256x256 resource classes");
+        Log("sprite_256: runtime code=%08X table=%08X; classes=32x32,32x64,64x32,64x64,128x128,128x256,256x256",
             (DWORD)g_code, (DWORD)g_table);
     }
 
