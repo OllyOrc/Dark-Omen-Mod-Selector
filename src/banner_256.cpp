@@ -9,6 +9,11 @@
 // and +0x28, derive a sprite-wide maximum body/top proxy, calculate K from the
 // existing 650/1100/1800 curve, and cache that result by owner only.
 //
+// Body-entry ownership is captured before pushIconDrawRecord loses provenance:
+// FUN_00469840 arms the real unit for exactly one push, the default-queue branch
+// commits that unit to the final queue slot, and a post-call cleanup always
+// clears the handoff. The old shared-queue entry+0x1c association is retired.
+//
 // The bounds-refresh repair remains in place so a newly discovered non-zero K
 // is consumed promptly. Owner-cached sprites with native max height <=160 use
 // the requested 50% final raise tuning. Larger owners, including the Dread King,
@@ -20,28 +25,33 @@
 namespace banner_256
 {
     static const DWORD HOOK_CLASSIFY       = 0x0042B84F;
-    static const DWORD HOOK_ENTRY          = 0x0042B97F;
     static const DWORD HOOK_RENDER         = 0x00442B49;
     static const DWORD HOOK_PROJECTION_E   = 0x0043FD2C;
     static const DWORD HOOK_PROJECTION_F   = 0x0043FE24;
     static const DWORD HOOK_PROJECTION_G   = 0x00450427;
     static const DWORD HOOK_ANCHOR         = 0x004504B8;
 
+    // Trusted body-entry association handoff.
+    static const DWORD HOOK_BODY_ARM       = 0x00469C34;
+    static const DWORD HOOK_BODY_CLEAR     = 0x00469C3E;
+    static const DWORD HOOK_QUEUE_COMMIT   = 0x0045226D;
+
     static const DWORD RETURN_CLASSIFY     = 0x0042B854;
-    static const DWORD RETURN_ENTRY        = 0x0042B986;
     static const DWORD RETURN_RENDER       = 0x00442B4E;
     static const DWORD RETURN_PROJECTION_E = 0x0043FD32;
     static const DWORD RETURN_PROJECTION_F = 0x0043FE2A;
     static const DWORD RETURN_PROJECTION_G = 0x0045042C;
     static const DWORD RETURN_ANCHOR       = 0x004504BF;
 
+    static const DWORD RETURN_BODY_ARM     = 0x00469C39;
+    static const DWORD RETURN_BODY_CLEAR   = 0x00469C48;
+    static const DWORD RETURN_QUEUE_COMMIT = 0x00452274;
+
     static const DWORD CALL_PROJECT_BUFFER = 0x00427C30;
     static const DWORD BOUNDS_REFRESH_COOLDOWN = 0x004E4A00;
 
     static const BYTE kOriginalClassify[5] =
         { 0x8B,0x6F,0x48,0x85,0xED };
-    static const BYTE kOriginalEntry[7] =
-        { 0xC7,0x45,0x10,0x00,0x00,0x00,0x00 };
     static const BYTE kOriginalRender[5] =
         { 0x57,0x55,0x8B,0x4E,0x04 };
     static const BYTE kOriginalProjectionE[6] =
@@ -52,6 +62,13 @@ namespace banner_256
         { 0xE8,0x04,0x78,0xFD,0xFF };
     static const BYTE kOriginalAnchor[7] =
         { 0xA1,0x14,0x37,0x50,0x00,0x2B,0xC2 };
+
+    static const BYTE kOriginalBodyArm[5] =
+        { 0x8D,0x44,0x24,0x1C,0x50 };
+    static const BYTE kOriginalBodyClear[5] =
+        { 0x83,0xC4,0x04,0xEB,0x05 };
+    static const BYTE kOriginalQueueCommit[7] =
+        { 0xA1,0xE4,0x7D,0x56,0x00,0x03,0xF8 };
 
     static const float ANCHOR_K_MEDIUM = 650.0f;
     static const float ANCHOR_K_MID    = 1100.0f;
@@ -117,6 +134,7 @@ namespace banner_256
     static BYTE* g_caves = NULL;
     static BOOL g_loaded = FALSE;
 
+    static volatile DWORD g_pendingBodyUnit = 0;
     static volatile DWORD g_projectionWScratchBits = 0;
     static volatile DWORD g_currentProjectionUnit = 0;
     static volatile DWORD g_lastProjectionUnit = 0;
@@ -320,6 +338,30 @@ namespace banner_256
             g_entryToUnit[freeSlot].entry = entry;
             g_entryToUnit[freeSlot].unit = unit;
         }
+    }
+
+    static void __cdecl ArmBodyUnit(DWORD unit)
+    {
+        // Never inherit state from an earlier push attempt.
+        g_pendingBodyUnit = 0;
+        g_pendingBodyUnit = unit;
+    }
+
+    static void __cdecl CommitBodyEntry(DWORD entry)
+    {
+        const DWORD unit = g_pendingBodyUnit;
+
+        // Consume immediately. The post-call cleanup remains the load-bearing
+        // guarantee for front/temp queue paths where this function never runs.
+        g_pendingBodyUnit = 0;
+
+        if (entry != 0 && unit != 0)
+            RecordEntryUnit(entry, unit);
+    }
+
+    static void __cdecl ClearPendingBodyUnit()
+    {
+        g_pendingBodyUnit = 0;
     }
 
     static DWORD FindUnitForEntry(DWORD entry)
@@ -597,7 +639,7 @@ namespace banner_256
     static BOOL BuildCaves()
     {
         g_caves = (BYTE*)VirtualAlloc(
-            NULL, 0x200, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+            NULL, 0x300, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (g_caves == NULL) return FALSE;
 
         BYTE* a = g_caves + 0x00;
@@ -614,21 +656,6 @@ namespace banner_256
         DWORD jumpA = n; a[n++] = 0xE9; n += 4;
         WriteRel32(a + callA, (DWORD)&MarkUnitClass);
         WriteRel32(a + jumpA, RETURN_CLASSIFY);
-
-        BYTE* c = g_caves + 0x40;
-        n = 0;
-        c[n++] = 0xC7; c[n++] = 0x45; c[n++] = 0x10;
-        *((DWORD*)(c + n)) = 0; n += 4;
-        c[n++] = 0x9C; c[n++] = 0x60;
-        c[n++] = 0x8B; c[n++] = 0x44; c[n++] = 0x24; c[n++] = 0x34;
-        c[n++] = 0x8B; c[n++] = 0x40; c[n++] = 0x1C;
-        c[n++] = 0x50; c[n++] = 0x55;
-        DWORD callC = n; c[n++] = 0xE8; n += 4;
-        c[n++] = 0x83; c[n++] = 0xC4; c[n++] = 0x08;
-        c[n++] = 0x61; c[n++] = 0x9D;
-        DWORD jumpC = n; c[n++] = 0xE9; n += 4;
-        WriteRel32(c + callC, (DWORD)&RecordEntryUnit);
-        WriteRel32(c + jumpC, RETURN_ENTRY);
 
         BYTE* d = g_caves + 0x80;
         n = 0;
@@ -697,7 +724,52 @@ namespace banner_256
         WriteRel32(g + callG, CALL_PROJECT_BUFFER);
         WriteRel32(g + jumpG, RETURN_PROJECTION_G);
 
-        FlushInstructionCache(GetCurrentProcess(), g_caves, 0x200);
+        // Hook 1: trusted body push caller. Reproduce LEA/PUSH first so the
+        // original source-buffer argument remains exactly where the untouched
+        // CALL at 0x00469C39 expects it, then arm the real unit from EBP.
+        BYTE* arm = g_caves + 0x1C0;
+        n = 0;
+        arm[n++] = 0x8D; arm[n++] = 0x44; arm[n++] = 0x24; arm[n++] = 0x1C;
+        arm[n++] = 0x50;
+        arm[n++] = 0x9C; arm[n++] = 0x60;
+        arm[n++] = 0x55;
+        DWORD callArm = n; arm[n++] = 0xE8; n += 4;
+        arm[n++] = 0x83; arm[n++] = 0xC4; arm[n++] = 0x04;
+        arm[n++] = 0x61; arm[n++] = 0x9D;
+        DWORD jumpArm = n; arm[n++] = 0xE9; n += 4;
+        WriteRel32(arm + callArm, (DWORD)&ArmBodyUnit);
+        WriteRel32(arm + jumpArm, RETURN_BODY_ARM);
+
+        // Post-call cleanup: load-bearing guarantee that the pending handoff
+        // never survives beyond one pushIconDrawRecord invocation, regardless
+        // of whether that call chose default, front, or temp queue.
+        BYTE* clear = g_caves + 0x200;
+        n = 0;
+        clear[n++] = 0x83; clear[n++] = 0xC4; clear[n++] = 0x04;
+        clear[n++] = 0x9C; clear[n++] = 0x60;
+        DWORD callClear = n; clear[n++] = 0xE8; n += 4;
+        clear[n++] = 0x61; clear[n++] = 0x9D;
+        DWORD jumpClear = n; clear[n++] = 0xE9; n += 4;
+        WriteRel32(clear + callClear, (DWORD)&ClearPendingBodyUnit);
+        WriteRel32(clear + jumpClear, RETURN_BODY_CLEAR);
+
+        // Default queue branch: after MOV EAX,[00567DE4] / ADD EDI,EAX, EDI is
+        // the real final destination slot. Commit only if Hook 1 armed a unit.
+        BYTE* commit = g_caves + 0x240;
+        n = 0;
+        commit[n++] = 0xA1;
+        *((DWORD*)(commit + n)) = 0x00567DE4; n += 4;
+        commit[n++] = 0x03; commit[n++] = 0xF8;
+        commit[n++] = 0x9C; commit[n++] = 0x60;
+        commit[n++] = 0x57;
+        DWORD callCommit = n; commit[n++] = 0xE8; n += 4;
+        commit[n++] = 0x83; commit[n++] = 0xC4; commit[n++] = 0x04;
+        commit[n++] = 0x61; commit[n++] = 0x9D;
+        DWORD jumpCommit = n; commit[n++] = 0xE9; n += 4;
+        WriteRel32(commit + callCommit, (DWORD)&CommitBodyEntry);
+        WriteRel32(commit + jumpCommit, RETURN_QUEUE_COMMIT);
+
+        FlushInstructionCache(GetCurrentProcess(), g_caves, 0x300);
         return TRUE;
     }
 
@@ -706,12 +778,14 @@ namespace banner_256
         if (g_loaded) return;
 
         if (!BytesEqual(HOOK_CLASSIFY, kOriginalClassify, sizeof(kOriginalClassify)) ||
-            !BytesEqual(HOOK_ENTRY, kOriginalEntry, sizeof(kOriginalEntry)) ||
             !BytesEqual(HOOK_RENDER, kOriginalRender, sizeof(kOriginalRender)) ||
             !BytesEqual(HOOK_PROJECTION_E, kOriginalProjectionE, sizeof(kOriginalProjectionE)) ||
             !BytesEqual(HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjectionF)) ||
             !BytesEqual(HOOK_PROJECTION_G, kOriginalProjectionG, sizeof(kOriginalProjectionG)) ||
-            !BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)))
+            !BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)) ||
+            !BytesEqual(HOOK_BODY_ARM, kOriginalBodyArm, sizeof(kOriginalBodyArm)) ||
+            !BytesEqual(HOOK_BODY_CLEAR, kOriginalBodyClear, sizeof(kOriginalBodyClear)) ||
+            !BytesEqual(HOOK_QUEUE_COMMIT, kOriginalQueueCommit, sizeof(kOriginalQueueCommit)))
         {
             darkomen::detour::trace("Stage11 install FAIL byte guard");
             FlushTrace();
@@ -721,6 +795,7 @@ namespace banner_256
         memset(g_units, 0, sizeof(g_units));
         memset(g_entryToUnit, 0, sizeof(g_entryToUnit));
         memset(g_ownerK, 0, sizeof(g_ownerK));
+        g_pendingBodyUnit = 0;
         g_projectionWScratchBits = 0;
         g_currentProjectionUnit = 0;
         g_lastProjectionUnit = 0;
@@ -730,17 +805,20 @@ namespace banner_256
         if (!BuildCaves()) return;
 
         WriteJump(HOOK_CLASSIFY,     (DWORD)(g_caves + 0x00), 5);
-        WriteJump(HOOK_ENTRY,        (DWORD)(g_caves + 0x40), 7);
         WriteJump(HOOK_RENDER,       (DWORD)(g_caves + 0x80), 5);
         WriteJump(HOOK_PROJECTION_E, (DWORD)(g_caves + 0x100), 6);
         WriteJump(HOOK_PROJECTION_F, (DWORD)(g_caves + 0x140), 6);
         WriteJump(HOOK_PROJECTION_G, (DWORD)(g_caves + 0x180), 5);
         WriteJump(HOOK_ANCHOR,       (DWORD)(g_caves + 0xC0), 7);
+
+        WriteJump(HOOK_BODY_ARM,     (DWORD)(g_caves + 0x1C0), 5);
+        WriteJump(HOOK_BODY_CLEAR,   (DWORD)(g_caves + 0x200), 5);
+        WriteJump(HOOK_QUEUE_COMMIT, (DWORD)(g_caves + 0x240), 7);
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: owner-only native K + 50%% <=160 tuning + zero-K refresh suppression active");
+            "Stage11 installed: trusted body-entry association + owner-only native K + 50%% <=160 tuning + zero-K refresh suppression active");
         FlushTrace();
     }
 
@@ -749,12 +827,15 @@ namespace banner_256
         if (!g_loaded) return;
 
         memcpy((void*)HOOK_CLASSIFY,     kOriginalClassify,     sizeof(kOriginalClassify));
-        memcpy((void*)HOOK_ENTRY,        kOriginalEntry,        sizeof(kOriginalEntry));
         memcpy((void*)HOOK_RENDER,       kOriginalRender,       sizeof(kOriginalRender));
         memcpy((void*)HOOK_PROJECTION_E, kOriginalProjectionE, sizeof(kOriginalProjectionE));
         memcpy((void*)HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjectionF));
         memcpy((void*)HOOK_PROJECTION_G, kOriginalProjectionG, sizeof(kOriginalProjectionG));
         memcpy((void*)HOOK_ANCHOR,       kOriginalAnchor,       sizeof(kOriginalAnchor));
+
+        memcpy((void*)HOOK_BODY_ARM,     kOriginalBodyArm,     sizeof(kOriginalBodyArm));
+        memcpy((void*)HOOK_BODY_CLEAR,   kOriginalBodyClear,   sizeof(kOriginalBodyClear));
+        memcpy((void*)HOOK_QUEUE_COMMIT, kOriginalQueueCommit, sizeof(kOriginalQueueCommit));
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
 
         if (g_caves != NULL)
@@ -764,6 +845,7 @@ namespace banner_256
         memset(g_units, 0, sizeof(g_units));
         memset(g_entryToUnit, 0, sizeof(g_entryToUnit));
         memset(g_ownerK, 0, sizeof(g_ownerK));
+        g_pendingBodyUnit = 0;
         g_projectionWScratchBits = 0;
         g_currentProjectionUnit = 0;
         g_lastProjectionUnit = 0;
