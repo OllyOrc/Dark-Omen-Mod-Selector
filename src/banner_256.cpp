@@ -11,8 +11,10 @@
 //
 // Body-entry ownership is captured before pushIconDrawRecord loses provenance:
 // FUN_00469840 arms the real unit for exactly one push, the default-queue branch
-// commits that unit to the final queue slot, and a post-call cleanup always
-// clears the handoff. The old shared-queue entry+0x1c association is retired.
+// commits that unit to the final source queue slot, and a post-call cleanup
+// always clears the handoff. When buildUnitBodySpriteDrawQueue later creates its
+// downstream body-draw record, Hook C propagates only that trusted association;
+// it never reads the shared queue's accidental/stale entry+0x1c contents.
 //
 // The bounds-refresh repair remains in place so a newly discovered non-zero K
 // is consumed promptly. Owner-cached sprites with native max height <=160 use
@@ -25,6 +27,7 @@
 namespace banner_256
 {
     static const DWORD HOOK_CLASSIFY       = 0x0042B84F;
+    static const DWORD HOOK_ENTRY          = 0x0042B97F;
     static const DWORD HOOK_RENDER         = 0x00442B49;
     static const DWORD HOOK_PROJECTION_E   = 0x0043FD2C;
     static const DWORD HOOK_PROJECTION_F   = 0x0043FE24;
@@ -37,6 +40,7 @@ namespace banner_256
     static const DWORD HOOK_QUEUE_COMMIT   = 0x0045226D;
 
     static const DWORD RETURN_CLASSIFY     = 0x0042B854;
+    static const DWORD RETURN_ENTRY        = 0x0042B986;
     static const DWORD RETURN_RENDER       = 0x00442B4E;
     static const DWORD RETURN_PROJECTION_E = 0x0043FD32;
     static const DWORD RETURN_PROJECTION_F = 0x0043FE2A;
@@ -52,6 +56,8 @@ namespace banner_256
 
     static const BYTE kOriginalClassify[5] =
         { 0x8B,0x6F,0x48,0x85,0xED };
+    static const BYTE kOriginalEntry[7] =
+        { 0xC7,0x45,0x10,0x00,0x00,0x00,0x00 };
     static const BYTE kOriginalRender[5] =
         { 0x57,0x55,0x8B,0x4E,0x04 };
     static const BYTE kOriginalProjectionE[6] =
@@ -372,6 +378,20 @@ namespace banner_256
         return 0;
     }
 
+    static void __cdecl MarkTrustedUnitClass(DWORD sourceEntry, DWORD templateEntry)
+    {
+        const DWORD unit = FindUnitForEntry(sourceEntry);
+        if (unit != 0)
+            MarkUnitClass(unit, templateEntry);
+    }
+
+    static void __cdecl PropagateTrustedEntry(DWORD bodyEntry, DWORD sourceEntry)
+    {
+        const DWORD unit = FindUnitForEntry(sourceEntry);
+        if (unit != 0 && bodyEntry != 0)
+            RecordEntryUnit(bodyEntry, unit);
+    }
+
     static void __cdecl CaptureBodyTopExtent(DWORD entry)
     {
         const DWORD unit = FindUnitForEntry(entry);
@@ -646,7 +666,6 @@ namespace banner_256
         DWORD n = 0;
         a[n++] = 0x60;
         a[n++] = 0x8B; a[n++] = 0x44; a[n++] = 0x24; a[n++] = 0x30;
-        a[n++] = 0x8B; a[n++] = 0x40; a[n++] = 0x1C;
         a[n++] = 0x57; a[n++] = 0x50;
         DWORD callA = n; a[n++] = 0xE8; n += 4;
         a[n++] = 0x83; a[n++] = 0xC4; a[n++] = 0x08;
@@ -654,8 +673,26 @@ namespace banner_256
         a[n++] = 0x8B; a[n++] = 0x6F; a[n++] = 0x48;
         a[n++] = 0x85; a[n++] = 0xED;
         DWORD jumpA = n; a[n++] = 0xE9; n += 4;
-        WriteRel32(a + callA, (DWORD)&MarkUnitClass);
+        WriteRel32(a + callA, (DWORD)&MarkTrustedUnitClass);
         WriteRel32(a + jumpA, RETURN_CLASSIFY);
+
+        // Hook C is retained only as a trusted association propagation point.
+        // The source queue entry is still at original [ESP+10] (thus +34 after
+        // PUSHFD/PUSHAD). We map EBP, the downstream body record, from the
+        // already-trusted source entry instead of reading source+0x1c.
+        BYTE* c = g_caves + 0x40;
+        n = 0;
+        c[n++] = 0xC7; c[n++] = 0x45; c[n++] = 0x10;
+        *((DWORD*)(c + n)) = 0; n += 4;
+        c[n++] = 0x9C; c[n++] = 0x60;
+        c[n++] = 0x8B; c[n++] = 0x44; c[n++] = 0x24; c[n++] = 0x34;
+        c[n++] = 0x50; c[n++] = 0x55;
+        DWORD callC = n; c[n++] = 0xE8; n += 4;
+        c[n++] = 0x83; c[n++] = 0xC4; c[n++] = 0x08;
+        c[n++] = 0x61; c[n++] = 0x9D;
+        DWORD jumpC = n; c[n++] = 0xE9; n += 4;
+        WriteRel32(c + callC, (DWORD)&PropagateTrustedEntry);
+        WriteRel32(c + jumpC, RETURN_ENTRY);
 
         BYTE* d = g_caves + 0x80;
         n = 0;
@@ -754,7 +791,7 @@ namespace banner_256
         WriteRel32(clear + jumpClear, RETURN_BODY_CLEAR);
 
         // Default queue branch: after MOV EAX,[00567DE4] / ADD EDI,EAX, EDI is
-        // the real final destination slot. Commit only if Hook 1 armed a unit.
+        // the real final source queue slot. Commit only if Hook 1 armed a unit.
         BYTE* commit = g_caves + 0x240;
         n = 0;
         commit[n++] = 0xA1;
@@ -778,9 +815,10 @@ namespace banner_256
         if (g_loaded) return;
 
         if (!BytesEqual(HOOK_CLASSIFY, kOriginalClassify, sizeof(kOriginalClassify)) ||
+            !BytesEqual(HOOK_ENTRY, kOriginalEntry, sizeof(kOriginalEntry)) ||
             !BytesEqual(HOOK_RENDER, kOriginalRender, sizeof(kOriginalRender)) ||
             !BytesEqual(HOOK_PROJECTION_E, kOriginalProjectionE, sizeof(kOriginalProjectionE)) ||
-            !BytesEqual(HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjectionF)) ||
+            !BytesEqual(HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjection_F)) ||
             !BytesEqual(HOOK_PROJECTION_G, kOriginalProjectionG, sizeof(kOriginalProjectionG)) ||
             !BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)) ||
             !BytesEqual(HOOK_BODY_ARM, kOriginalBodyArm, sizeof(kOriginalBodyArm)) ||
@@ -805,6 +843,7 @@ namespace banner_256
         if (!BuildCaves()) return;
 
         WriteJump(HOOK_CLASSIFY,     (DWORD)(g_caves + 0x00), 5);
+        WriteJump(HOOK_ENTRY,        (DWORD)(g_caves + 0x40), 7);
         WriteJump(HOOK_RENDER,       (DWORD)(g_caves + 0x80), 5);
         WriteJump(HOOK_PROJECTION_E, (DWORD)(g_caves + 0x100), 6);
         WriteJump(HOOK_PROJECTION_F, (DWORD)(g_caves + 0x140), 6);
@@ -818,7 +857,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: trusted body-entry association + owner-only native K + 50%% <=160 tuning + zero-K refresh suppression active");
+            "Stage11 installed: trusted source-to-body association + owner-only native K + 50%% <=160 tuning + zero-K refresh suppression active");
         FlushTrace();
     }
 
@@ -827,6 +866,7 @@ namespace banner_256
         if (!g_loaded) return;
 
         memcpy((void*)HOOK_CLASSIFY,     kOriginalClassify,     sizeof(kOriginalClassify));
+        memcpy((void*)HOOK_ENTRY,        kOriginalEntry,        sizeof(kOriginalEntry));
         memcpy((void*)HOOK_RENDER,       kOriginalRender,       sizeof(kOriginalRender));
         memcpy((void*)HOOK_PROJECTION_E, kOriginalProjectionE, sizeof(kOriginalProjectionE));
         memcpy((void*)HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjectionF));
