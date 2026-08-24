@@ -17,10 +17,10 @@
 // it never reads the shared queue's accidental/stale entry+0x1c contents.
 //
 // A newly discovered non-zero K forces bounds refresh once per genuinely new
-// (owner,K,scale) signature. Owner-cached sprites use a continuous final-raise
-// scale from 50% at native max height <=150 to 100% at >=170, eliminating the
-// old 160/161 discontinuity while preserving smaller and larger known-good
-// calibrations. Zero-K owners never force the global bounds cooldown.
+// (owner,K,scale) signature. Enlarged sprites use one proportional banner-gap
+// rule derived from the validated native-147 reference: effective K per top
+// pixel is 3.6503. This keeps banner-to-head spacing at the same visual ratio
+// across sprite sizes while zero-K vanilla owners remain completely untouched.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -87,9 +87,12 @@ namespace banner_256
 
     static const float MEDIUM_BODY_MIN = 99.0f;
     static const float MEDIUM_TOP_MIN  = 110.0f;
-    static const DWORD OWNER_RAISE_SCALE_RAMP_MIN_HEIGHT = 150;
-    static const DWORD OWNER_RAISE_SCALE_RAMP_MAX_HEIGHT = 170;
-    static const float OWNER_MIN_RAISE_SCALE = 0.5f;
+
+    // Native-147 reference: maxTop=149.0, K=1087.8, scale=0.50.
+    // Effective K = 1087.8 * 0.50 = 543.9, so effective K/top = 3.6503.
+    // Applying the same effective-K-per-top ratio keeps the banner gap
+    // proportional to apparent sprite height at every zoom/depth.
+    static const float PROPORTIONAL_EFFECTIVE_K_PER_TOP = 3.6503f;
 
     struct UNIT_STATE
     {
@@ -277,20 +280,11 @@ namespace banner_256
             k = ContinuousAnchorK(maxTop);
 
         float raiseScale = 1.0f;
-        if (k > 0.0f)
+        if (k > 0.0f && maxTop > 0.0f)
         {
-            if (maxHeight <= OWNER_RAISE_SCALE_RAMP_MIN_HEIGHT)
-            {
-                raiseScale = OWNER_MIN_RAISE_SCALE;
-            }
-            else if (maxHeight < OWNER_RAISE_SCALE_RAMP_MAX_HEIGHT)
-            {
-                const float t =
-                    ((float)maxHeight - (float)OWNER_RAISE_SCALE_RAMP_MIN_HEIGHT) /
-                    ((float)OWNER_RAISE_SCALE_RAMP_MAX_HEIGHT - (float)OWNER_RAISE_SCALE_RAMP_MIN_HEIGHT);
-                raiseScale = OWNER_MIN_RAISE_SCALE +
-                    t * (1.0f - OWNER_MIN_RAISE_SCALE);
-            }
+            const float targetEffectiveK =
+                maxTop * PROPORTIONAL_EFFECTIVE_K_PER_TOP;
+            raiseScale = targetEffectiveK / k;
         }
 
         cache->frameBase = frameBase;
@@ -882,7 +876,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: trusted source-to-body association + owner-only native K + 50%% <=150 / linear-to-100%% at 170 tuning + refresh-signature suppression active");
+            "Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + refresh-signature suppression active");
         FlushTrace();
     }
 
