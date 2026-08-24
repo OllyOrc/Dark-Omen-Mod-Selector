@@ -818,7 +818,7 @@ namespace banner_256
             !BytesEqual(HOOK_ENTRY, kOriginalEntry, sizeof(kOriginalEntry)) ||
             !BytesEqual(HOOK_RENDER, kOriginalRender, sizeof(kOriginalRender)) ||
             !BytesEqual(HOOK_PROJECTION_E, kOriginalProjectionE, sizeof(kOriginalProjectionE)) ||
-            !BytesEqual(HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjection_F)) ||
+            !BytesEqual(HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjectionF)) ||
             !BytesEqual(HOOK_PROJECTION_G, kOriginalProjectionG, sizeof(kOriginalProjectionG)) ||
             !BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)) ||
             !BytesEqual(HOOK_BODY_ARM, kOriginalBodyArm, sizeof(kOriginalBodyArm)) ||
