@@ -1,26 +1,18 @@
-// Stage11: zoom-aware banner positioning with continuous enlarged-body scaling.
+// Stage11: zoom-aware banner positioning with owner-stable sprite geometry.
 //
-// Dark Omen can report enlarged sprites through either nominal 128x128 or the
-// added 128x256 resource bucket. The render frame record provides a per-frame
-// body/top proxy, but different animation poses from the same SPR can produce
-// very different proxy values. Classifying each live unit from only its current
-// pose therefore caused identical Trolls to disagree about banner height.
+// Atlas/resource buckets are per-frame packing details and can change while a
+// unit animates. Banner classification must therefore follow the SPR owner and
+// native frame geometry, not the current 128x128/128x256/256x256 bucket.
 //
-// Stage11 now treats the sprite owner as the authoritative classification key.
 // owner+0x08 is the frame count and owner+0x10 is the 0x2c-stride frame table.
-// On first sight of an owner/resource-class combination we scan that complete
-// table once, derive a sprite-wide maximum body/top proxy, calculate K from the
-// existing 650/1100/1800 curve, and cache it. Every unit using that same owner
-// therefore receives the same K regardless of its current animation frame.
+// We scan each owner once, read native frame width/height directly from +0x24
+// and +0x28, derive a sprite-wide maximum body/top proxy, calculate K from the
+// existing 650/1100/1800 curve, and cache that result by owner only.
 //
-// The previously proven bounds-refresh fix remains: computeUnitScreenBounds is
-// gated by DAT_004E4A00, so when a non-zero K becomes known late we force that
-// cooldown to zero and retain the immediate cached-Y delta repair as an assist.
-//
-// Visual tuning: owner-cached sprites which still resolve through the original
-// 128x128 resource class use half of the final K/W raise. This deliberately does
-// NOT affect 128x256 or 256x256 paths, preserving the calibrated Dread King and
-// intermediate/full enlarged-sprite banner positions.
+// The bounds-refresh repair remains in place so a newly discovered non-zero K
+// is consumed promptly. Small/medium owner-cached enlarged sprites whose native
+// body maximum remains <=128 retain the requested 50% final raise tuning. Larger
+// owners, including the Dread King, remain at full scale.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -84,9 +76,9 @@ namespace banner_256
         BOOL hasCalibrationTop;
         DWORD spriteOwner;
         float ownerCachedK;
+        float ownerRaiseScale;
         BOOL hasOwnerCachedK;
         BOOL loggedClass;
-        BOOL loggedSuppressedSmaller;
         BOOL loggedExtent;
         BOOL loggedRaise;
         BOOL loggedRawFrame;
@@ -106,13 +98,13 @@ namespace banner_256
     struct OWNER_K_CACHE
     {
         DWORD owner;
-        DWORD resourceWidth;
-        DWORD resourceHeight;
         DWORD frameBase;
         DWORD frameCount;
-        float maxBodyHeightPx;
+        DWORD maxNativeWidth;
+        DWORD maxNativeHeight;
         float maxTopExtentPx;
         float cachedK;
+        float raiseScale;
         BOOL valid;
         BOOL logged;
     };
@@ -187,18 +179,16 @@ namespace banner_256
         if (freeSlot >= _countof(g_units)) return NULL;
         memset(&g_units[freeSlot], 0, sizeof(g_units[freeSlot]));
         g_units[freeSlot].unit = unit;
+        g_units[freeSlot].ownerRaiseScale = 1.0f;
         return &g_units[freeSlot];
     }
 
-    static OWNER_K_CACHE* FindOwnerCache(DWORD owner, DWORD width, DWORD height)
+    static OWNER_K_CACHE* FindOwnerCache(DWORD owner)
     {
         DWORD freeSlot = _countof(g_ownerK);
         for (DWORD i = 0; i < _countof(g_ownerK); ++i)
         {
-            if (g_ownerK[i].valid &&
-                g_ownerK[i].owner == owner &&
-                g_ownerK[i].resourceWidth == width &&
-                g_ownerK[i].resourceHeight == height)
+            if (g_ownerK[i].valid && g_ownerK[i].owner == owner)
                 return &g_ownerK[i];
 
             if (freeSlot == _countof(g_ownerK) && !g_ownerK[i].valid)
@@ -208,16 +198,15 @@ namespace banner_256
         if (freeSlot >= _countof(g_ownerK)) return NULL;
         memset(&g_ownerK[freeSlot], 0, sizeof(g_ownerK[freeSlot]));
         g_ownerK[freeSlot].owner = owner;
-        g_ownerK[freeSlot].resourceWidth = width;
-        g_ownerK[freeSlot].resourceHeight = height;
+        g_ownerK[freeSlot].raiseScale = 1.0f;
         return &g_ownerK[freeSlot];
     }
 
-    static OWNER_K_CACHE* ScanOwnerK(DWORD owner, DWORD width, DWORD height)
+    static OWNER_K_CACHE* ScanOwnerK(DWORD owner)
     {
         if (owner == 0) return NULL;
 
-        OWNER_K_CACHE* cache = FindOwnerCache(owner, width, height);
+        OWNER_K_CACHE* cache = FindOwnerCache(owner);
         if (cache == NULL) return NULL;
         if (cache->valid) return cache;
 
@@ -226,72 +215,60 @@ namespace banner_256
         if (frameCount == 0 || frameCount > 4096 || frameBase == 0)
             return NULL;
 
-        const float backingHeight = (height == 256) ? 256.0f :
-                                    ((height == 128) ? 128.0f : 0.0f);
-        if (backingHeight <= 0.0f)
-            return NULL;
-
-        float maxBody = 0.0f;
+        DWORD maxWidth = 0;
+        DWORD maxHeight = 0;
         float maxTop = 0.0f;
 
         for (DWORD i = 0; i < frameCount; ++i)
         {
             const DWORD frameRecord = frameBase + (i * 0x2C);
+            const DWORD nativeWidth = *((DWORD*)(frameRecord + 0x24));
+            const DWORD nativeHeight = *((DWORD*)(frameRecord + 0x28));
 
-            float frameScale = *((float*)(frameRecord + 0x14));
             float yOffsetRatio = *((float*)(frameRecord + 0x1C));
-            if (frameScale < 0.0f) frameScale = -frameScale;
             if (yOffsetRatio < 0.0f) yOffsetRatio = -yOffsetRatio;
 
-            const float nativeHeight = frameScale * backingHeight;
-            const float topExtent = yOffsetRatio * nativeHeight;
+            if (nativeWidth == 0 || nativeWidth >= 1024 ||
+                nativeHeight == 0 || nativeHeight >= 1024)
+                continue;
 
-            if (nativeHeight > 0.0f && nativeHeight < 1024.0f &&
-                topExtent > 0.0f && topExtent < 1024.0f)
-            {
-                if (nativeHeight > maxBody) maxBody = nativeHeight;
-                if (topExtent > maxTop) maxTop = topExtent;
-            }
+            const float topExtent = yOffsetRatio * (float)nativeHeight;
+            if (!(topExtent > 0.0f && topExtent < 1024.0f))
+                continue;
+
+            if (nativeWidth > maxWidth) maxWidth = nativeWidth;
+            if (nativeHeight > maxHeight) maxHeight = nativeHeight;
+            if (topExtent > maxTop) maxTop = topExtent;
         }
 
         float k = 0.0f;
-        if (height == 256 && width == 256)
-        {
-            k = ANCHOR_K_LARGE;
-        }
-        else if (height == 256 && width == 128)
-        {
-            k = (maxTop > 0.0f) ? ContinuousAnchorK(maxTop) : ANCHOR_K_MEDIUM;
-        }
-        else if (height == 128 &&
-                 maxBody >= MEDIUM_BODY_MIN &&
-                 maxTop >= MEDIUM_TOP_MIN)
-        {
+        if (maxHeight >= (DWORD)MEDIUM_BODY_MIN && maxTop >= MEDIUM_TOP_MIN)
             k = ContinuousAnchorK(maxTop);
-        }
+
+        float raiseScale = 1.0f;
+        if (k > 0.0f && maxHeight <= 128)
+            raiseScale = OWNER_128_RAISE_SCALE;
 
         cache->frameBase = frameBase;
         cache->frameCount = frameCount;
-        cache->maxBodyHeightPx = maxBody;
+        cache->maxNativeWidth = maxWidth;
+        cache->maxNativeHeight = maxHeight;
         cache->maxTopExtentPx = maxTop;
         cache->cachedK = k;
+        cache->raiseScale = raiseScale;
         cache->valid = TRUE;
 
         if (!cache->logged)
         {
             darkomen::detour::trace(
-                "Stage11 ownerScan owner=%08lX resource=%lux%lu frameBase=%08lX frames=%lu maxBody=%.1f maxTop=%.1f K=%.1f",
-                owner, width, height, frameBase, frameCount, maxBody, maxTop, k);
+                "Stage11 ownerScan owner=%08lX frameBase=%08lX frames=%lu maxNative=%lux%lu maxTop=%.1f K=%.1f scale=%.2f",
+                owner, frameBase, frameCount, maxWidth, maxHeight,
+                maxTop, k, raiseScale);
             FlushTrace();
             cache->logged = TRUE;
         }
 
         return cache;
-    }
-
-    static BOOL IsExtendedTallClass(DWORD width, DWORD height)
-    {
-        return (height == 256 && (width == 128 || width == 256)) ? TRUE : FALSE;
     }
 
     static void __cdecl MarkUnitClass(DWORD unit, DWORD templateEntry)
@@ -300,72 +277,25 @@ namespace banner_256
 
         const DWORD width  = *((DWORD*)(templateEntry + 0x18));
         const DWORD height = *((DWORD*)(templateEntry + 0x1C));
-        const BOOL extendedTall = IsExtendedTallClass(width, height);
 
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state == NULL) return;
 
-        if (extendedTall)
-        {
-            const BOOL newlyExtended =
-                (state->resourceHeight != 256 || width > state->resourceWidth);
-
-            if (newlyExtended)
-            {
-                state->resourceWidth = width;
-                state->resourceHeight = height;
-                state->bodyHeightPx = 0.0f;
-                state->topExtentPx = 0.0f;
-                state->calibrationTopPx = 0.0f;
-                state->hasCalibrationTop = FALSE;
-                state->spriteOwner = 0;
-                state->ownerCachedK = 0.0f;
-                state->hasOwnerCachedK = FALSE;
-                state->loggedExtent = FALSE;
-                state->loggedRaise = FALSE;
-                state->loggedRawFrame = FALSE;
-                state->loggedOwner = FALSE;
-                state->loggedImmediatePatch = FALSE;
-
-                // Hook A can run after this unit's previous bounds computation.
-                // Force the engine's own render-order/bounds pass to become due.
-                ForceBoundsRefresh(unit, "extendedClass");
-            }
-
-            if (!state->loggedClass)
-            {
-                darkomen::detour::trace(
-                    "Stage11 extendedClass detected unit=%08lX template=%08lX width=%lu height=%lu",
-                    unit, templateEntry, width, height);
-                FlushTrace();
-                state->loggedClass = TRUE;
-            }
-
-            RefreshCachedAnchor(state);
-            return;
-        }
-
-        if (state->resourceHeight == 256)
-        {
-            if (!state->loggedSuppressedSmaller)
-            {
-                darkomen::detour::trace(
-                    "Stage11 suppressed extended->smaller unit=%08lX template=%08lX width=%lu height=%lu",
-                    unit, templateEntry, width, height);
-                FlushTrace();
-                state->loggedSuppressedSmaller = TRUE;
-            }
-            return;
-        }
-
-        if (state->resourceWidth != width || state->resourceHeight != height)
-        {
-            state->spriteOwner = 0;
-            state->ownerCachedK = 0.0f;
-            state->hasOwnerCachedK = FALSE;
-        }
+        // Resource class is retained for diagnostics only. Per-frame atlas
+        // packing must never replace or invalidate the owner-wide K.
+        const BOOL changed =
+            (state->resourceWidth != width || state->resourceHeight != height);
         state->resourceWidth = width;
         state->resourceHeight = height;
+
+        if (changed && !state->loggedClass)
+        {
+            darkomen::detour::trace(
+                "Stage11 resourceClass observed unit=%08lX template=%08lX width=%lu height=%lu (owner K preserved)",
+                unit, templateEntry, width, height);
+            FlushTrace();
+            state->loggedClass = TRUE;
+        }
     }
 
     static void __cdecl RecordEntryUnit(DWORD entry, DWORD unit)
@@ -408,6 +338,8 @@ namespace banner_256
         if (state == NULL) return;
 
         const float oldK = GetAnchorK(state);
+        const float oldScale = GetRaiseScale(state);
+        const DWORD oldOwner = state->spriteOwner;
 
         const DWORD owner = *((DWORD*)entry);
         if (owner == 0) return;
@@ -417,7 +349,7 @@ namespace banner_256
         const LONG frameIndex = *((LONG*)(entry + 0x04));
         if (frameIndex < 0 || frameIndex > 4096) return;
 
-        if (!state->loggedOwner)
+        if (!state->loggedOwner || oldOwner != owner)
         {
             const DWORD* o = (const DWORD*)owner;
             darkomen::detour::trace(
@@ -431,18 +363,15 @@ namespace banner_256
             state->loggedOwner = TRUE;
         }
 
-        OWNER_K_CACHE* ownerCache =
-            ScanOwnerK(owner, state->resourceWidth, state->resourceHeight);
+        OWNER_K_CACHE* ownerCache = ScanOwnerK(owner);
         if (ownerCache != NULL && ownerCache->valid)
         {
             state->spriteOwner = owner;
             state->ownerCachedK = ownerCache->cachedK;
+            state->ownerRaiseScale = ownerCache->raiseScale;
             state->hasOwnerCachedK = TRUE;
-
-            if (ownerCache->maxBodyHeightPx > state->bodyHeightPx)
-                state->bodyHeightPx = ownerCache->maxBodyHeightPx;
-            if (ownerCache->maxTopExtentPx > state->topExtentPx)
-                state->topExtentPx = ownerCache->maxTopExtentPx;
+            state->bodyHeightPx = (float)ownerCache->maxNativeHeight;
+            state->topExtentPx = ownerCache->maxTopExtentPx;
         }
 
         const DWORD frameRecord = frameBase + ((DWORD)frameIndex * 0x2C);
@@ -461,48 +390,42 @@ namespace banner_256
             state->loggedRawFrame = TRUE;
         }
 
-        float frameScale = *((float*)(frameRecord + 0x14));
+        const DWORD nativeHeight = *((DWORD*)(frameRecord + 0x28));
         float yOffsetRatio = *((float*)(frameRecord + 0x1C));
-        if (frameScale < 0.0f) frameScale = -frameScale;
         if (yOffsetRatio < 0.0f) yOffsetRatio = -yOffsetRatio;
 
-        const float backingHeight = (state->resourceHeight == 256) ? 256.0f :
-                                    ((state->resourceHeight == 128) ? 128.0f : 0.0f);
-        if (backingHeight <= 0.0f) return;
-
-        const float nativeHeight = frameScale * backingHeight;
-        const float topExtent = yOffsetRatio * nativeHeight;
-        if (!(nativeHeight > 0.0f && nativeHeight < 1024.0f)) return;
-        if (!(topExtent > 0.0f && topExtent < 1024.0f)) return;
-
-        if (!state->hasCalibrationTop)
+        if (nativeHeight > 0 && nativeHeight < 1024)
         {
-            state->calibrationTopPx = topExtent;
-            state->hasCalibrationTop = TRUE;
-            state->loggedRaise = FALSE;
-            state->loggedImmediatePatch = FALSE;
+            const float topExtent = yOffsetRatio * (float)nativeHeight;
+            if (topExtent > 0.0f && topExtent < 1024.0f)
+            {
+                state->calibrationTopPx = topExtent;
+                state->hasCalibrationTop = TRUE;
+            }
         }
-
-        if (nativeHeight > state->bodyHeightPx)
-            state->bodyHeightPx = nativeHeight;
-        if (topExtent > state->topExtentPx)
-            state->topExtentPx = topExtent;
 
         if (!state->loggedExtent)
         {
             darkomen::detour::trace(
-                "Stage11 bodyProxy unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f calibrationTop=%.1f ownerK=%.1f",
+                "Stage11 bodyProxy unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f calibrationTop=%.1f owner=%08lX ownerK=%.1f scale=%.2f",
                 unit, state->resourceWidth, state->resourceHeight,
                 state->bodyHeightPx, state->topExtentPx, state->calibrationTopPx,
-                state->hasOwnerCachedK ? state->ownerCachedK : -1.0f);
+                state->spriteOwner,
+                state->hasOwnerCachedK ? state->ownerCachedK : -1.0f,
+                state->ownerRaiseScale);
             FlushTrace();
             state->loggedExtent = TRUE;
         }
 
         const float newK = GetAnchorK(state);
-        if (oldK <= 0.0f && newK > 0.0f)
+        const float newScale = GetRaiseScale(state);
+        if ((oldK <= 0.0f && newK > 0.0f) ||
+            oldOwner != state->spriteOwner ||
+            oldK != newK || oldScale != newScale)
         {
-            ForceBoundsRefresh(unit, "ownerK0toNonzero");
+            state->loggedRaise = FALSE;
+            state->loggedImmediatePatch = FALSE;
+            ForceBoundsRefresh(unit, "ownerGeometryChanged");
         }
 
         RefreshCachedAnchor(state);
@@ -553,47 +476,16 @@ namespace banner_256
 
     static float GetAnchorK(const UNIT_STATE* state)
     {
-        if (state == NULL) return 0.0f;
-
-        if (state->hasOwnerCachedK)
-            return state->ownerCachedK;
-
-        if (state->resourceHeight == 256 && state->resourceWidth == 256)
-            return ANCHOR_K_LARGE;
-
-        if (state->resourceHeight == 256 && state->resourceWidth == 128)
-        {
-            if (!state->hasCalibrationTop)
-                return ANCHOR_K_MEDIUM;
-            return ContinuousAnchorK(state->calibrationTopPx);
-        }
-
-        if (state->resourceHeight == 128 &&
-            state->bodyHeightPx >= MEDIUM_BODY_MIN &&
-            state->topExtentPx >= MEDIUM_TOP_MIN)
-        {
-            const float top = state->hasCalibrationTop ?
-                state->calibrationTopPx : state->topExtentPx;
-            return ContinuousAnchorK(top);
-        }
-
-        return 0.0f;
+        if (state == NULL || !state->hasOwnerCachedK)
+            return 0.0f;
+        return state->ownerCachedK;
     }
 
     static float GetRaiseScale(const UNIT_STATE* state)
     {
-        // Only owner-classified enlarged sprites which still live in the
-        // original 128x128 resource bucket receive the requested 50% visual
-        // reduction. 128x256 and 256x256 keep their established calibration.
-        if (state != NULL &&
-            state->hasOwnerCachedK &&
-            state->resourceWidth == 128 &&
-            state->resourceHeight == 128)
-        {
-            return OWNER_128_RAISE_SCALE;
-        }
-
-        return 1.0f;
+        if (state == NULL || !state->hasOwnerCachedK)
+            return 1.0f;
+        return state->ownerRaiseScale;
     }
 
     static int CalculateRaise(const UNIT_STATE* state)
@@ -624,9 +516,6 @@ namespace banner_256
             return;
 
         const int desiredRaise = CalculateRaise(state);
-        if (desiredRaise <= 0)
-            return;
-
         const int delta = desiredRaise - state->lastAppliedRaise;
         if (delta == 0)
             return;
@@ -849,7 +738,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: owner-wide K cache + 50%% 128x128 tuning + bounds refresh active");
+            "Stage11 installed: owner-only native frame K cache + bounds refresh active");
         FlushTrace();
     }
 
