@@ -17,9 +17,10 @@
 // it never reads the shared queue's accidental/stale entry+0x1c contents.
 //
 // A newly discovered non-zero K forces bounds refresh once per genuinely new
-// (owner,K,scale) signature. Owner-cached sprites with native max height <=160
-// use the requested 50% final raise tuning. Larger owners, including Dread King,
-// remain full scale. Zero-K owners never force the global bounds cooldown.
+// (owner,K,scale) signature. Owner-cached sprites use a continuous final-raise
+// scale from 50% at native max height <=150 to 100% at >=170, eliminating the
+// old 160/161 discontinuity while preserving smaller and larger known-good
+// calibrations. Zero-K owners never force the global bounds cooldown.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -86,8 +87,9 @@ namespace banner_256
 
     static const float MEDIUM_BODY_MIN = 99.0f;
     static const float MEDIUM_TOP_MIN  = 110.0f;
-    static const DWORD OWNER_HALF_SCALE_MAX_NATIVE_HEIGHT = 160;
-    static const float OWNER_128_RAISE_SCALE = 0.5f;
+    static const DWORD OWNER_RAISE_SCALE_RAMP_MIN_HEIGHT = 150;
+    static const DWORD OWNER_RAISE_SCALE_RAMP_MAX_HEIGHT = 170;
+    static const float OWNER_MIN_RAISE_SCALE = 0.5f;
 
     struct UNIT_STATE
     {
@@ -275,8 +277,21 @@ namespace banner_256
             k = ContinuousAnchorK(maxTop);
 
         float raiseScale = 1.0f;
-        if (k > 0.0f && maxHeight <= OWNER_HALF_SCALE_MAX_NATIVE_HEIGHT)
-            raiseScale = OWNER_128_RAISE_SCALE;
+        if (k > 0.0f)
+        {
+            if (maxHeight <= OWNER_RAISE_SCALE_RAMP_MIN_HEIGHT)
+            {
+                raiseScale = OWNER_MIN_RAISE_SCALE;
+            }
+            else if (maxHeight < OWNER_RAISE_SCALE_RAMP_MAX_HEIGHT)
+            {
+                const float t =
+                    ((float)maxHeight - (float)OWNER_RAISE_SCALE_RAMP_MIN_HEIGHT) /
+                    ((float)OWNER_RAISE_SCALE_RAMP_MAX_HEIGHT - (float)OWNER_RAISE_SCALE_RAMP_MIN_HEIGHT);
+                raiseScale = OWNER_MIN_RAISE_SCALE +
+                    t * (1.0f - OWNER_MIN_RAISE_SCALE);
+            }
+        }
 
         cache->frameBase = frameBase;
         cache->frameCount = frameCount;
@@ -867,7 +882,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: trusted source-to-body association + owner-only native K + 50%% <=160 tuning + refresh-signature suppression active");
+            "Stage11 installed: trusted source-to-body association + owner-only native K + 50%% <=150 / linear-to-100%% at 170 tuning + refresh-signature suppression active");
         FlushTrace();
     }
 
