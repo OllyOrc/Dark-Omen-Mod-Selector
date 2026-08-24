@@ -1,26 +1,21 @@
 // Stage11: zoom-aware banner positioning with continuous enlarged-body scaling.
 //
 // Dark Omen can report enlarged sprites through either nominal 128x128 or the
-// added 128x256 resource bucket. The render frame record provides a stable
-// per-body top-extent proxy even though it does not expose RDose's literal source
-// dimensions directly. We calibrate once from the first valid body frame for a
-// live unit and use a three-point continuous curve through the proven 133%-Troll
-// point (top~=113, K=650), the ~202px Troll point (top~=150, K=1100), and the
-// full-size point (top~=165+, K=1800).
+// added 128x256 resource bucket. The render frame record provides a per-frame
+// body/top proxy, but different animation poses from the same SPR can produce
+// very different proxy values. Classifying each live unit from only its current
+// pose therefore caused identical Trolls to disagree about banner height.
 //
-// Stage11 root-cause fix: computeUnitScreenBounds is not rebuilt every frame for
-// every unit. Its render-order pass is gated by DAT_004E4A00, which is reset to
-// 0x19 after a rebuild and only becomes eligible again when the cooldown reaches
-// zero (or an event explicitly forces it to zero). If enlarged classification
-// arrives after the last bounds computation, the unit can remain at vanilla
-// head-height until camera movement triggers another bounds rebuild.
+// Stage11 now treats the sprite owner as the authoritative classification key.
+// owner+0x08 is the frame count and owner+0x10 is the 0x2c-stride frame table.
+// On first sight of an owner/resource-class combination we scan that complete
+// table once, derive a sprite-wide maximum body/top proxy, calculate K from the
+// existing 650/1100/1800 curve, and cache it. Every unit using that same owner
+// therefore receives the same K regardless of its current animation frame.
 //
-// Therefore, whenever a unit newly becomes an enlarged/tall resource OR its
-// measured-body K transitions from zero to non-zero, Stage11 now writes
-// DAT_004E4A00=0. This asks Dark Omen itself to perform a fresh bounds/render-order
-// rebuild on the next opportunity, rather than depending on camera movement.
-// The previous cached-Y delta repair remains as a harmless immediate assist, but
-// the cooldown reset is the authoritative fix for the discovered engine gate.
+// The previously proven bounds-refresh fix remains: computeUnitScreenBounds is
+// gated by DAT_004E4A00, so when a non-zero K becomes known late we force that
+// cooldown to zero and retain the immediate cached-Y delta repair as an assist.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -81,6 +76,9 @@ namespace banner_256
         float topExtentPx;
         float calibrationTopPx;
         BOOL hasCalibrationTop;
+        DWORD spriteOwner;
+        float ownerCachedK;
+        BOOL hasOwnerCachedK;
         BOOL loggedClass;
         BOOL loggedSuppressedSmaller;
         BOOL loggedExtent;
@@ -99,8 +97,23 @@ namespace banner_256
         DWORD unit;
     };
 
+    struct OWNER_K_CACHE
+    {
+        DWORD owner;
+        DWORD resourceWidth;
+        DWORD resourceHeight;
+        DWORD frameBase;
+        DWORD frameCount;
+        float maxBodyHeightPx;
+        float maxTopExtentPx;
+        float cachedK;
+        BOOL valid;
+        BOOL logged;
+    };
+
     static UNIT_STATE g_units[400];
     static ENTRY_UNIT_LINK g_entryToUnit[400];
+    static OWNER_K_CACHE g_ownerK[256];
 
     static BYTE* g_caves = NULL;
     static BOOL g_loaded = FALSE;
@@ -111,6 +124,7 @@ namespace banner_256
     static volatile DWORD g_lastProjectionWBits = 0;
     static volatile DWORD g_projectionSequence = 0;
 
+    static float ContinuousAnchorK(float top);
     static float GetAnchorK(const UNIT_STATE* state);
     static void RefreshCachedAnchor(UNIT_STATE* state);
 
@@ -169,6 +183,105 @@ namespace banner_256
         return &g_units[freeSlot];
     }
 
+    static OWNER_K_CACHE* FindOwnerCache(DWORD owner, DWORD width, DWORD height)
+    {
+        DWORD freeSlot = _countof(g_ownerK);
+        for (DWORD i = 0; i < _countof(g_ownerK); ++i)
+        {
+            if (g_ownerK[i].valid &&
+                g_ownerK[i].owner == owner &&
+                g_ownerK[i].resourceWidth == width &&
+                g_ownerK[i].resourceHeight == height)
+                return &g_ownerK[i];
+
+            if (freeSlot == _countof(g_ownerK) && !g_ownerK[i].valid)
+                freeSlot = i;
+        }
+
+        if (freeSlot >= _countof(g_ownerK)) return NULL;
+        memset(&g_ownerK[freeSlot], 0, sizeof(g_ownerK[freeSlot]));
+        g_ownerK[freeSlot].owner = owner;
+        g_ownerK[freeSlot].resourceWidth = width;
+        g_ownerK[freeSlot].resourceHeight = height;
+        return &g_ownerK[freeSlot];
+    }
+
+    static OWNER_K_CACHE* ScanOwnerK(DWORD owner, DWORD width, DWORD height)
+    {
+        if (owner == 0) return NULL;
+
+        OWNER_K_CACHE* cache = FindOwnerCache(owner, width, height);
+        if (cache == NULL) return NULL;
+        if (cache->valid) return cache;
+
+        const DWORD frameCount = *((DWORD*)(owner + 0x08));
+        const DWORD frameBase = *((DWORD*)(owner + 0x10));
+        if (frameCount == 0 || frameCount > 4096 || frameBase == 0)
+            return NULL;
+
+        const float backingHeight = (height == 256) ? 256.0f :
+                                    ((height == 128) ? 128.0f : 0.0f);
+        if (backingHeight <= 0.0f)
+            return NULL;
+
+        float maxBody = 0.0f;
+        float maxTop = 0.0f;
+
+        for (DWORD i = 0; i < frameCount; ++i)
+        {
+            const DWORD frameRecord = frameBase + (i * 0x2C);
+
+            float frameScale = *((float*)(frameRecord + 0x14));
+            float yOffsetRatio = *((float*)(frameRecord + 0x1C));
+            if (frameScale < 0.0f) frameScale = -frameScale;
+            if (yOffsetRatio < 0.0f) yOffsetRatio = -yOffsetRatio;
+
+            const float nativeHeight = frameScale * backingHeight;
+            const float topExtent = yOffsetRatio * nativeHeight;
+
+            if (nativeHeight > 0.0f && nativeHeight < 1024.0f &&
+                topExtent > 0.0f && topExtent < 1024.0f)
+            {
+                if (nativeHeight > maxBody) maxBody = nativeHeight;
+                if (topExtent > maxTop) maxTop = topExtent;
+            }
+        }
+
+        float k = 0.0f;
+        if (height == 256 && width == 256)
+        {
+            k = ANCHOR_K_LARGE;
+        }
+        else if (height == 256 && width == 128)
+        {
+            k = (maxTop > 0.0f) ? ContinuousAnchorK(maxTop) : ANCHOR_K_MEDIUM;
+        }
+        else if (height == 128 &&
+                 maxBody >= MEDIUM_BODY_MIN &&
+                 maxTop >= MEDIUM_TOP_MIN)
+        {
+            k = ContinuousAnchorK(maxTop);
+        }
+
+        cache->frameBase = frameBase;
+        cache->frameCount = frameCount;
+        cache->maxBodyHeightPx = maxBody;
+        cache->maxTopExtentPx = maxTop;
+        cache->cachedK = k;
+        cache->valid = TRUE;
+
+        if (!cache->logged)
+        {
+            darkomen::detour::trace(
+                "Stage11 ownerScan owner=%08lX resource=%lux%lu frameBase=%08lX frames=%lu maxBody=%.1f maxTop=%.1f K=%.1f",
+                owner, width, height, frameBase, frameCount, maxBody, maxTop, k);
+            FlushTrace();
+            cache->logged = TRUE;
+        }
+
+        return cache;
+    }
+
     static BOOL IsExtendedTallClass(DWORD width, DWORD height)
     {
         return (height == 256 && (width == 128 || width == 256)) ? TRUE : FALSE;
@@ -198,6 +311,9 @@ namespace banner_256
                 state->topExtentPx = 0.0f;
                 state->calibrationTopPx = 0.0f;
                 state->hasCalibrationTop = FALSE;
+                state->spriteOwner = 0;
+                state->ownerCachedK = 0.0f;
+                state->hasOwnerCachedK = FALSE;
                 state->loggedExtent = FALSE;
                 state->loggedRaise = FALSE;
                 state->loggedRawFrame = FALSE;
@@ -235,6 +351,12 @@ namespace banner_256
             return;
         }
 
+        if (state->resourceWidth != width || state->resourceHeight != height)
+        {
+            state->spriteOwner = 0;
+            state->ownerCachedK = 0.0f;
+            state->hasOwnerCachedK = FALSE;
+        }
         state->resourceWidth = width;
         state->resourceHeight = height;
     }
@@ -302,6 +424,20 @@ namespace banner_256
             state->loggedOwner = TRUE;
         }
 
+        OWNER_K_CACHE* ownerCache =
+            ScanOwnerK(owner, state->resourceWidth, state->resourceHeight);
+        if (ownerCache != NULL && ownerCache->valid)
+        {
+            state->spriteOwner = owner;
+            state->ownerCachedK = ownerCache->cachedK;
+            state->hasOwnerCachedK = TRUE;
+
+            if (ownerCache->maxBodyHeightPx > state->bodyHeightPx)
+                state->bodyHeightPx = ownerCache->maxBodyHeightPx;
+            if (ownerCache->maxTopExtentPx > state->topExtentPx)
+                state->topExtentPx = ownerCache->maxTopExtentPx;
+        }
+
         const DWORD frameRecord = frameBase + ((DWORD)frameIndex * 0x2C);
 
         if (!state->loggedRawFrame)
@@ -348,9 +484,10 @@ namespace banner_256
         if (!state->loggedExtent)
         {
             darkomen::detour::trace(
-                "Stage11 bodyProxy unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f calibrationTop=%.1f",
+                "Stage11 bodyProxy unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f calibrationTop=%.1f ownerK=%.1f",
                 unit, state->resourceWidth, state->resourceHeight,
-                state->bodyHeightPx, state->topExtentPx, state->calibrationTopPx);
+                state->bodyHeightPx, state->topExtentPx, state->calibrationTopPx,
+                state->hasOwnerCachedK ? state->ownerCachedK : -1.0f);
             FlushTrace();
             state->loggedExtent = TRUE;
         }
@@ -358,10 +495,7 @@ namespace banner_256
         const float newK = GetAnchorK(state);
         if (oldK <= 0.0f && newK > 0.0f)
         {
-            // This is the important nominal-128x128 enlarged case: body
-            // measurement, rather than Hook A, is what first proves it needs a
-            // banner correction. Make the engine's bounds refresh immediately due.
-            ForceBoundsRefresh(unit, "K0toNonzero");
+            ForceBoundsRefresh(unit, "ownerK0toNonzero");
         }
 
         RefreshCachedAnchor(state);
@@ -413,6 +547,9 @@ namespace banner_256
     static float GetAnchorK(const UNIT_STATE* state)
     {
         if (state == NULL) return 0.0f;
+
+        if (state->hasOwnerCachedK)
+            return state->ownerCachedK;
 
         if (state->resourceHeight == 256 && state->resourceWidth == 256)
             return ANCHOR_K_LARGE;
@@ -528,9 +665,11 @@ namespace banner_256
         if (safeRaise > 0 && !state->loggedRaise)
         {
             darkomen::detour::trace(
-                "Stage11 anchorRaiseK unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f calibrationTop=%.1f W=%.6f K=%.1f raise=%d",
+                "Stage11 anchorRaiseK unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f calibrationTop=%.1f owner=%08lX ownerK=%.1f W=%.6f K=%.1f raise=%d",
                 unit, state->resourceWidth, state->resourceHeight,
                 state->bodyHeightPx, state->topExtentPx, state->calibrationTopPx,
+                state->spriteOwner,
+                state->hasOwnerCachedK ? state->ownerCachedK : -1.0f,
                 w, anchorK, safeRaise);
             FlushTrace();
             state->loggedRaise = TRUE;
@@ -665,6 +804,7 @@ namespace banner_256
 
         memset(g_units, 0, sizeof(g_units));
         memset(g_entryToUnit, 0, sizeof(g_entryToUnit));
+        memset(g_ownerK, 0, sizeof(g_ownerK));
         g_projectionWScratchBits = 0;
         g_currentProjectionUnit = 0;
         g_lastProjectionUnit = 0;
@@ -684,7 +824,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: force bounds refresh + K=650/1100/1800 scaling active");
+            "Stage11 installed: owner-wide sprite K cache + bounds refresh active");
         FlushTrace();
     }
 
@@ -707,6 +847,7 @@ namespace banner_256
         g_caves = NULL;
         memset(g_units, 0, sizeof(g_units));
         memset(g_entryToUnit, 0, sizeof(g_entryToUnit));
+        memset(g_ownerK, 0, sizeof(g_ownerK));
         g_projectionWScratchBits = 0;
         g_currentProjectionUnit = 0;
         g_lastProjectionUnit = 0;
