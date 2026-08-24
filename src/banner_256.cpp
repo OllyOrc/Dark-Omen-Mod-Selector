@@ -10,9 +10,9 @@
 // existing 650/1100/1800 curve, and cache that result by owner only.
 //
 // The bounds-refresh repair remains in place so a newly discovered non-zero K
-// is consumed promptly. Small/medium owner-cached enlarged sprites whose native
-// body maximum remains <=128 retain the requested 50% final raise tuning. Larger
-// owners, including the Dread King, remain at full scale.
+// is consumed promptly. Owner-cached sprites with native max height <=160 use
+// the requested 50% final raise tuning. Larger owners, including the Dread King,
+// remain at full scale. Zero-K owners never force the global bounds cooldown.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -63,6 +63,7 @@ namespace banner_256
 
     static const float MEDIUM_BODY_MIN = 99.0f;
     static const float MEDIUM_TOP_MIN  = 110.0f;
+    static const DWORD OWNER_HALF_SCALE_MAX_NATIVE_HEIGHT = 160;
     static const float OWNER_128_RAISE_SCALE = 0.5f;
 
     struct UNIT_STATE
@@ -246,7 +247,7 @@ namespace banner_256
             k = ContinuousAnchorK(maxTop);
 
         float raiseScale = 1.0f;
-        if (k > 0.0f && maxHeight <= 128)
+        if (k > 0.0f && maxHeight <= OWNER_HALF_SCALE_MAX_NATIVE_HEIGHT)
             raiseScale = OWNER_128_RAISE_SCALE;
 
         cache->frameBase = frameBase;
@@ -349,7 +350,7 @@ namespace banner_256
         const LONG frameIndex = *((LONG*)(entry + 0x04));
         if (frameIndex < 0 || frameIndex > 4096) return;
 
-        if (!state->loggedOwner || oldOwner != owner)
+        if (!state->loggedOwner)
         {
             const DWORD* o = (const DWORD*)owner;
             darkomen::detour::trace(
@@ -419,9 +420,10 @@ namespace banner_256
 
         const float newK = GetAnchorK(state);
         const float newScale = GetRaiseScale(state);
-        if ((oldK <= 0.0f && newK > 0.0f) ||
-            oldOwner != state->spriteOwner ||
-            oldK != newK || oldScale != newScale)
+        if (newK > 0.0f &&
+            ((oldK <= 0.0f && newK > 0.0f) ||
+             oldOwner != state->spriteOwner ||
+             oldK != newK || oldScale != newScale))
         {
             state->loggedRaise = FALSE;
             state->loggedImmediatePatch = FALSE;
@@ -738,7 +740,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: owner-only native frame K cache + bounds refresh active");
+            "Stage11 installed: owner-only native K + 50%% <=160 tuning + zero-K refresh suppression active");
         FlushTrace();
     }
 
