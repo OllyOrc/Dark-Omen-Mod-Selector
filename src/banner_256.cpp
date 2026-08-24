@@ -16,10 +16,10 @@
 // downstream body-draw record, Hook C propagates only that trusted association;
 // it never reads the shared queue's accidental/stale entry+0x1c contents.
 //
-// The bounds-refresh repair remains in place so a newly discovered non-zero K
-// is consumed promptly. Owner-cached sprites with native max height <=160 use
-// the requested 50% final raise tuning. Larger owners, including the Dread King,
-// remain at full scale. Zero-K owners never force the global bounds cooldown.
+// A newly discovered non-zero K forces bounds refresh once per genuinely new
+// (owner,K,scale) signature. Owner-cached sprites with native max height <=160
+// use the requested 50% final raise tuning. Larger owners, including Dread King,
+// remain full scale. Zero-K owners never force the global bounds cooldown.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -111,6 +111,10 @@ namespace banner_256
         int lastAppliedRaise;
         DWORD projectionWBits;
         DWORD projectionSequence;
+        DWORD lastRefreshOwner;
+        float lastRefreshK;
+        float lastRefreshScale;
+        BOOL hasRefreshSignature;
     };
 
     struct ENTRY_UNIT_LINK
@@ -400,10 +404,6 @@ namespace banner_256
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state == NULL) return;
 
-        const float oldK = GetAnchorK(state);
-        const float oldScale = GetRaiseScale(state);
-        const DWORD oldOwner = state->spriteOwner;
-
         const DWORD owner = *((DWORD*)entry);
         if (owner == 0) return;
         const DWORD frameBase = *((DWORD*)(owner + 0x10));
@@ -482,11 +482,21 @@ namespace banner_256
 
         const float newK = GetAnchorK(state);
         const float newScale = GetRaiseScale(state);
-        if (newK > 0.0f &&
-            ((oldK <= 0.0f && newK > 0.0f) ||
-             oldOwner != state->spriteOwner ||
-             oldK != newK || oldScale != newScale))
+        const BOOL refreshChanged =
+            !state->hasRefreshSignature ||
+            state->lastRefreshOwner != state->spriteOwner ||
+            state->lastRefreshK != newK ||
+            state->lastRefreshScale != newScale;
+
+        if (newK > 0.0f && refreshChanged)
         {
+            // Cache the actual signature that caused the refresh. If a unit-array
+            // slot is later reused by a different owner, the mismatch naturally
+            // forces a new refresh without any separate slot-generation state.
+            state->lastRefreshOwner = state->spriteOwner;
+            state->lastRefreshK = newK;
+            state->lastRefreshScale = newScale;
+            state->hasRefreshSignature = TRUE;
             state->loggedRaise = FALSE;
             state->loggedImmediatePatch = FALSE;
             ForceBoundsRefresh(unit, "ownerGeometryChanged");
@@ -857,7 +867,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: trusted source-to-body association + owner-only native K + 50%% <=160 tuning + zero-K refresh suppression active");
+            "Stage11 installed: trusted source-to-body association + owner-only native K + 50%% <=160 tuning + refresh-signature suppression active");
         FlushTrace();
     }
 
