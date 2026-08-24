@@ -16,6 +16,11 @@
 // The previously proven bounds-refresh fix remains: computeUnitScreenBounds is
 // gated by DAT_004E4A00, so when a non-zero K becomes known late we force that
 // cooldown to zero and retain the immediate cached-Y delta repair as an assist.
+//
+// Visual tuning: owner-cached sprites which still resolve through the original
+// 128x128 resource class use half of the final K/W raise. This deliberately does
+// NOT affect 128x256 or 256x256 paths, preserving the calibrated Dread King and
+// intermediate/full enlarged-sprite banner positions.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -66,6 +71,7 @@ namespace banner_256
 
     static const float MEDIUM_BODY_MIN = 99.0f;
     static const float MEDIUM_TOP_MIN  = 110.0f;
+    static const float OWNER_128_RAISE_SCALE = 0.5f;
 
     struct UNIT_STATE
     {
@@ -126,6 +132,7 @@ namespace banner_256
 
     static float ContinuousAnchorK(float top);
     static float GetAnchorK(const UNIT_STATE* state);
+    static float GetRaiseScale(const UNIT_STATE* state);
     static void RefreshCachedAnchor(UNIT_STATE* state);
 
     static void FlushTrace()
@@ -573,6 +580,22 @@ namespace banner_256
         return 0.0f;
     }
 
+    static float GetRaiseScale(const UNIT_STATE* state)
+    {
+        // Only owner-classified enlarged sprites which still live in the
+        // original 128x128 resource bucket receive the requested 50% visual
+        // reduction. 128x256 and 256x256 keep their established calibration.
+        if (state != NULL &&
+            state->hasOwnerCachedK &&
+            state->resourceWidth == 128 &&
+            state->resourceHeight == 128)
+        {
+            return OWNER_128_RAISE_SCALE;
+        }
+
+        return 1.0f;
+    }
+
     static int CalculateRaise(const UNIT_STATE* state)
     {
         if (state == NULL || state->projectionWBits == 0)
@@ -590,7 +613,8 @@ namespace banner_256
         if (!(absW > 0.0001f && absW < 1000000.0f))
             return 0;
 
-        const int raise = (int)((anchorK / absW) + 0.5f);
+        const float raiseScale = GetRaiseScale(state);
+        const int raise = (int)(((anchorK / absW) * raiseScale) + 0.5f);
         return (raise > 0 && raise < 1024) ? raise : 0;
     }
 
@@ -658,19 +682,20 @@ namespace banner_256
             return 0;
         }
 
-        const int raise = (int)((anchorK / absW) + 0.5f);
+        const float raiseScale = GetRaiseScale(state);
+        const int raise = (int)(((anchorK / absW) * raiseScale) + 0.5f);
         const int safeRaise = (raise > 0 && raise < 1024) ? raise : 0;
         state->lastAppliedRaise = safeRaise;
 
         if (safeRaise > 0 && !state->loggedRaise)
         {
             darkomen::detour::trace(
-                "Stage11 anchorRaiseK unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f calibrationTop=%.1f owner=%08lX ownerK=%.1f W=%.6f K=%.1f raise=%d",
+                "Stage11 anchorRaiseK unit=%08lX resource=%lux%lu bodyH=%.1f top=%.1f calibrationTop=%.1f owner=%08lX ownerK=%.1f W=%.6f K=%.1f scale=%.2f raise=%d",
                 unit, state->resourceWidth, state->resourceHeight,
                 state->bodyHeightPx, state->topExtentPx, state->calibrationTopPx,
                 state->spriteOwner,
                 state->hasOwnerCachedK ? state->ownerCachedK : -1.0f,
-                w, anchorK, safeRaise);
+                w, anchorK, raiseScale, safeRaise);
             FlushTrace();
             state->loggedRaise = TRUE;
         }
@@ -824,7 +849,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: owner-wide sprite K cache + bounds refresh active");
+            "Stage11 installed: owner-wide K cache + 50%% 128x128 tuning + bounds refresh active");
         FlushTrace();
     }
 
