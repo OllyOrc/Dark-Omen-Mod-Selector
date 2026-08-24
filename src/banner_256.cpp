@@ -8,13 +8,19 @@
 // point (top~=113, K=650), the ~202px Troll point (top~=150, K=1100), and the
 // full-size point (top~=165+, K=1800).
 //
-// Important timing fix: computeUnitScreenBounds can run before the body/resource
-// pass has identified an enlarged Troll. Dark Omen may then keep the old cached
-// unit+0x6C banner anchor until the camera changes. As soon as the body/resource
-// pass discovers a better K, we now repair that cached Y anchor by the delta
-// between the old and new raise. The next normal bounds pass still uses Hook B,
-// so this does not accumulate and camera movement is no longer required to make
-// an already-visible enlarged unit adopt its corrected banner height.
+// Stage11 root-cause fix: computeUnitScreenBounds is not rebuilt every frame for
+// every unit. Its render-order pass is gated by DAT_004E4A00, which is reset to
+// 0x19 after a rebuild and only becomes eligible again when the cooldown reaches
+// zero (or an event explicitly forces it to zero). If enlarged classification
+// arrives after the last bounds computation, the unit can remain at vanilla
+// head-height until camera movement triggers another bounds rebuild.
+//
+// Therefore, whenever a unit newly becomes an enlarged/tall resource OR its
+// measured-body K transitions from zero to non-zero, Stage11 now writes
+// DAT_004E4A00=0. This asks Dark Omen itself to perform a fresh bounds/render-order
+// rebuild on the next opportunity, rather than depending on camera movement.
+// The previous cached-Y delta repair remains as a harmless immediate assist, but
+// the cooldown reset is the authoritative fix for the discovered engine gate.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -38,6 +44,7 @@ namespace banner_256
     static const DWORD RETURN_ANCHOR       = 0x004504BF;
 
     static const DWORD CALL_PROJECT_BUFFER = 0x00427C30;
+    static const DWORD BOUNDS_REFRESH_COOLDOWN = 0x004E4A00;
 
     static const BYTE kOriginalClassify[5] =
         { 0x8B,0x6F,0x48,0x85,0xED };
@@ -113,6 +120,18 @@ namespace banner_256
             fflush(darkomen::detour::traceFile);
     }
 
+    static void ForceBoundsRefresh(DWORD unit, const char* reason)
+    {
+        volatile LONG* cooldown = (volatile LONG*)BOUNDS_REFRESH_COOLDOWN;
+        const LONG before = *cooldown;
+        *cooldown = 0;
+
+        darkomen::detour::trace(
+            "Stage11 forceBoundsRefresh unit=%08lX reason=%s cooldown=%ld->0",
+            unit, reason, before);
+        FlushTrace();
+    }
+
     static BOOL BytesEqual(DWORD address, const BYTE* expected, DWORD count)
     {
         return (memcmp((const void*)address, expected, count) == 0);
@@ -168,7 +187,10 @@ namespace banner_256
 
         if (extendedTall)
         {
-            if (state->resourceHeight != 256 || width > state->resourceWidth)
+            const BOOL newlyExtended =
+                (state->resourceHeight != 256 || width > state->resourceWidth);
+
+            if (newlyExtended)
             {
                 state->resourceWidth = width;
                 state->resourceHeight = height;
@@ -181,6 +203,10 @@ namespace banner_256
                 state->loggedRawFrame = FALSE;
                 state->loggedOwner = FALSE;
                 state->loggedImmediatePatch = FALSE;
+
+                // Hook A can run after this unit's previous bounds computation.
+                // Force the engine's own render-order/bounds pass to become due.
+                ForceBoundsRefresh(unit, "extendedClass");
             }
 
             if (!state->loggedClass)
@@ -251,6 +277,8 @@ namespace banner_256
 
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state == NULL) return;
+
+        const float oldK = GetAnchorK(state);
 
         const DWORD owner = *((DWORD*)entry);
         if (owner == 0) return;
@@ -325,6 +353,15 @@ namespace banner_256
                 state->bodyHeightPx, state->topExtentPx, state->calibrationTopPx);
             FlushTrace();
             state->loggedExtent = TRUE;
+        }
+
+        const float newK = GetAnchorK(state);
+        if (oldK <= 0.0f && newK > 0.0f)
+        {
+            // This is the important nominal-128x128 enlarged case: body
+            // measurement, rather than Hook A, is what first proves it needs a
+            // banner correction. Make the engine's bounds refresh immediately due.
+            ForceBoundsRefresh(unit, "K0toNonzero");
         }
 
         RefreshCachedAnchor(state);
@@ -647,7 +684,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: immediate cached-anchor repair + K=650/1100/1800 scaling active");
+            "Stage11 installed: force bounds refresh + K=650/1100/1800 scaling active");
         FlushTrace();
     }
 
