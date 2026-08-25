@@ -771,7 +771,7 @@ namespace banner_256
     void Load()
     {
         if (g_loaded) return;
-        if (!BytesEqual(HOOK_CLASSIFY, kOriginalClassify, sizeof(kOriginalClassify)) || !BytesEqual(HOOK_ENTRY, kOriginalEntry, sizeof(kOriginalEntry)) || !BytesEqual(HOOK_RENDER, kOriginalRender, sizeof(kOriginalRender)) || !BytesEqual(HOOK_PROJECTION_E, kOriginalProjectionE, sizeof(kOriginalProjection_E)) || !BytesEqual(HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjectionF)) || !BytesEqual(HOOK_PROJECTION_G, kOriginalProjectionG, sizeof(kOriginalProjectionG)) || !BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)) || !BytesEqual(HOOK_BODY_ARM, kOriginalBodyArm, sizeof(kOriginalBodyArm)) || !BytesEqual(HOOK_BODY_CLEAR, kOriginalBodyClear, sizeof(kOriginalBodyClear)) || !BytesEqual(HOOK_QUEUE_COMMIT, kOriginalQueueCommit, sizeof(kOriginalQueueCommit)))
+        if (!BytesEqual(HOOK_CLASSIFY, kOriginalClassify, sizeof(kOriginalClassify)) || !BytesEqual(HOOK_ENTRY, kOriginalEntry, sizeof(kOriginalEntry)) || !BytesEqual(HOOK_RENDER, kOriginalRender, sizeof(kOriginalRender)) || !BytesEqual(HOOK_PROJECTION_E, kOriginalProjectionE, sizeof(kOriginalProjectionE)) || !BytesEqual(HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjectionF)) || !BytesEqual(HOOK_PROJECTION_G, kOriginalProjectionG, sizeof(kOriginalProjectionG)) || !BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)) || !BytesEqual(HOOK_BODY_ARM, kOriginalBodyArm, sizeof(kOriginalBodyArm)) || !BytesEqual(HOOK_BODY_CLEAR, kOriginalBodyClear, sizeof(kOriginalBodyClear)) || !BytesEqual(HOOK_QUEUE_COMMIT, kOriginalQueueCommit, sizeof(kOriginalQueueCommit)))
         {
             darkomen::detour::trace("Stage11 install FAIL byte guard");
             FlushTrace();
