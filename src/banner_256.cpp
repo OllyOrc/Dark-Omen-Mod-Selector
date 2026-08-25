@@ -24,8 +24,11 @@
 //
 // Stage11 state lives for the lifetime of EngRel.exe, while missions can be
 // loaded repeatedly without restarting the process. Entry/unit/owner tables are
-// therefore LRU-recycled when full, owner caches are revalidated against the
-// live frameBase/frameCount, and reused unit addresses are reset for new owners.
+// therefore LRU-recycled when full and owner caches are revalidated against the
+// live frameBase/frameCount. Unit state is now pinned only to managed K>0 SPR
+// owners: incidental zero-K body owners cannot repeatedly reset an enlarged
+// unit's state. A short freshness timeout safely drops a stale managed owner if
+// a reused unit slot later belongs only to vanilla geometry.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -59,6 +62,7 @@ namespace banner_256
 
     static const DWORD CALL_PROJECT_BUFFER = 0x00427C30;
     static const DWORD BOUNDS_REFRESH_COOLDOWN = 0x004E4A00;
+    static const DWORD MANAGED_OWNER_STALE_MS = 1500;
 
     static const BYTE kOriginalClassify[5] =
         { 0x8B,0x6F,0x48,0x85,0xED };
@@ -127,6 +131,7 @@ namespace banner_256
         float lastRefreshScale;
         BOOL hasRefreshSignature;
         DWORD lastTouch;
+        DWORD lastManagedOwnerTick;
     };
 
     struct ENTRY_UNIT_LINK
@@ -522,7 +527,7 @@ namespace banner_256
         const DWORD touch = state->lastTouch;
 
         darkomen::detour::trace(
-            "Stage11 unitState ownerReuse unit=%08lX oldOwner=%08lX newOwner=%08lX",
+            "Stage11 unitState managedOwnerReuse unit=%08lX oldOwner=%08lX newOwner=%08lX",
             unit, oldOwner, newOwner);
         FlushTrace();
 
@@ -532,6 +537,35 @@ namespace banner_256
         state->resourceHeight = resourceHeight;
         state->ownerRaiseScale = 1.0f;
         state->lastTouch = touch;
+    }
+
+    static void ExpireStaleManagedOwner(UNIT_STATE* state)
+    {
+        if (state == NULL || !state->hasOwnerCachedK ||
+            state->ownerCachedK <= 0.0f || state->lastManagedOwnerTick == 0)
+            return;
+
+        const DWORD age = GetTickCount() - state->lastManagedOwnerTick;
+        if (age <= MANAGED_OWNER_STALE_MS)
+            return;
+
+        darkomen::detour::trace(
+            "Stage11 managedOwner expire unit=%08lX owner=%08lX ageMs=%lu",
+            state->unit, state->spriteOwner, age);
+        FlushTrace();
+
+        state->spriteOwner = 0;
+        state->ownerCachedK = 0.0f;
+        state->ownerRaiseScale = 1.0f;
+        state->hasOwnerCachedK = FALSE;
+        state->hasRefreshSignature = FALSE;
+        state->lastRefreshOwner = 0;
+        state->lastRefreshK = 0.0f;
+        state->lastRefreshScale = 0.0f;
+        state->lastManagedOwnerTick = 0;
+        state->lastAppliedRaise = 0;
+        state->loggedRaise = FALSE;
+        state->loggedImmediatePatch = FALSE;
     }
 
     static void __cdecl CaptureBodyTopExtent(DWORD entry)
@@ -550,8 +584,27 @@ namespace banner_256
         const LONG frameIndex = *((LONG*)(entry + 0x04));
         if (frameIndex < 0 || frameIndex > 4096) return;
 
+        OWNER_K_CACHE* ownerCache = ScanOwnerK(owner);
+        if (ownerCache == NULL || !ownerCache->valid)
+            return;
+
+        // Stage11 only owns geometry for enlarged K>0 SPRs. The trusted body
+        // stream can legitimately present several zero-K owners for one unit;
+        // treating each one as a slot reuse caused tens of thousands of resets,
+        // logs and redundant bounds refreshes. Ignore those incidental owners.
+        if (ownerCache->cachedK <= 0.0f)
+            return;
+
         if (state->spriteOwner != 0 && state->spriteOwner != owner)
             ResetUnitStateForOwnerReuse(state, owner);
+
+        state->spriteOwner = owner;
+        state->ownerCachedK = ownerCache->cachedK;
+        state->ownerRaiseScale = ownerCache->raiseScale;
+        state->hasOwnerCachedK = TRUE;
+        state->bodyHeightPx = (float)ownerCache->maxNativeHeight;
+        state->topExtentPx = ownerCache->maxTopExtentPx;
+        state->lastManagedOwnerTick = GetTickCount();
 
         if (!state->loggedOwner)
         {
@@ -565,17 +618,6 @@ namespace banner_256
                 o[6], o[7], o[8], o[9], o[10]);
             FlushTrace();
             state->loggedOwner = TRUE;
-        }
-
-        OWNER_K_CACHE* ownerCache = ScanOwnerK(owner);
-        if (ownerCache != NULL && ownerCache->valid)
-        {
-            state->spriteOwner = owner;
-            state->ownerCachedK = ownerCache->cachedK;
-            state->ownerRaiseScale = ownerCache->raiseScale;
-            state->hasOwnerCachedK = TRUE;
-            state->bodyHeightPx = (float)ownerCache->maxNativeHeight;
-            state->topExtentPx = ownerCache->maxTopExtentPx;
         }
 
         const DWORD frameRecord = frameBase + ((DWORD)frameIndex * 0x2C);
@@ -615,7 +657,7 @@ namespace banner_256
                 unit, state->resourceWidth, state->resourceHeight,
                 state->bodyHeightPx, state->topExtentPx, state->calibrationTopPx,
                 state->spriteOwner,
-                state->hasOwnerCachedK ? state->ownerCachedK : -1.0f,
+                state->ownerCachedK,
                 state->ownerRaiseScale);
             FlushTrace();
             state->loggedExtent = TRUE;
@@ -631,9 +673,6 @@ namespace banner_256
 
         if (newK > 0.0f && refreshChanged)
         {
-            // Cache the actual signature that caused the refresh. If a unit-array
-            // slot is later reused by a different owner, the mismatch naturally
-            // forces a new refresh without any separate slot-generation state.
             state->lastRefreshOwner = state->spriteOwner;
             state->lastRefreshK = newK;
             state->lastRefreshScale = newScale;
@@ -761,6 +800,8 @@ namespace banner_256
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state == NULL) return 0;
 
+        ExpireStaleManagedOwner(state);
+
         const DWORD sequence = g_projectionSequence;
         if (g_lastProjectionUnit == unit &&
             g_lastProjectionWBits != 0 &&
@@ -802,7 +843,7 @@ namespace banner_256
                 unit, state->resourceWidth, state->resourceHeight,
                 state->bodyHeightPx, state->topExtentPx, state->calibrationTopPx,
                 state->spriteOwner,
-                state->hasOwnerCachedK ? state->ownerCachedK : -1.0f,
+                state->ownerCachedK,
                 w, anchorK, raiseScale, safeRaise);
             FlushTrace();
             state->loggedRaise = TRUE;
@@ -1013,7 +1054,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling active");
+            "Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression active");
         FlushTrace();
     }
 
