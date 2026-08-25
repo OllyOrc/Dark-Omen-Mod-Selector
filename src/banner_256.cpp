@@ -19,8 +19,8 @@
 // A newly discovered non-zero K forces bounds refresh once per genuinely new
 // (owner,K,scale) signature. Enlarged sprites use one proportional banner-gap
 // rule derived from the validated native-147 reference: effective K per top
-// pixel is 3.6503. This keeps banner-to-head spacing at the same visual ratio
-// across sprite sizes while zero-K vanilla owners remain completely untouched.
+// pixel is 3.6503. A further fixed +10px raise is applied only to those Stage11
+// enlarged sprites, leaving zero-K vanilla owners completely untouched.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -93,6 +93,7 @@ namespace banner_256
     // Applying the same effective-K-per-top ratio keeps the banner gap
     // proportional to apparent sprite height at every zoom/depth.
     static const float PROPORTIONAL_EFFECTIVE_K_PER_TOP = 3.6503f;
+    static const int STAGE11_BANNER_EXTRA_RAISE_PX = 10;
 
     struct UNIT_STATE
     {
@@ -589,7 +590,9 @@ namespace banner_256
             return 0;
 
         const float raiseScale = GetRaiseScale(state);
-        const int raise = (int)(((anchorK / absW) * raiseScale) + 0.5f);
+        const int proportionalRaise =
+            (int)(((anchorK / absW) * raiseScale) + 0.5f);
+        const int raise = proportionalRaise + STAGE11_BANNER_EXTRA_RAISE_PX;
         return (raise > 0 && raise < 1024) ? raise : 0;
     }
 
@@ -655,7 +658,9 @@ namespace banner_256
         }
 
         const float raiseScale = GetRaiseScale(state);
-        const int raise = (int)(((anchorK / absW) * raiseScale) + 0.5f);
+        const int proportionalRaise =
+            (int)(((anchorK / absW) * raiseScale) + 0.5f);
+        const int raise = proportionalRaise + STAGE11_BANNER_EXTRA_RAISE_PX;
         const int safeRaise = (raise > 0 && raise < 1024) ? raise : 0;
         state->lastAppliedRaise = safeRaise;
 
@@ -876,7 +881,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + refresh-signature suppression active");
+            "Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 10px enlarged-sprite lift + refresh-signature suppression active");
         FlushTrace();
     }
 
