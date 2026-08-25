@@ -13,9 +13,9 @@ namespace detour {
 	FILE* traceFile = NULL;
 	char darkomenExePath[MAX_PATH + 1] = {0};
 
-	// Stage11 diagnostics are intentionally dormant now that the banner work has
-	// completed validation. Set this to true when Stage11 tracing is needed again.
-	static const bool stage11TraceEnabled = false;
+	// Stage11 diagnostics can be disabled again after the current melee/banner
+	// validation is complete.
+	static const bool stage11TraceEnabled = true;
 
 	void hookFunc(void* hookFunc, int addr)
 	{
@@ -48,9 +48,6 @@ namespace detour {
 		if (!traceEnabled)
 			return;
 
-		// Keep the Stage11 instrumentation in the source for future diagnostics,
-		// but do not write it to trace.txt during normal play. This early return
-		// also avoids formatting and file-I/O cost for every Stage11 event.
 		if (!stage11TraceEnabled && fmt != NULL && strncmp(fmt, "Stage11 ", 8) == 0)
 			return;
 
@@ -58,18 +55,15 @@ namespace detour {
 		va_start(args, fmt);
 
 		char str[512];
-		// Get current time
 		time_t t = time(NULL);
 		struct tm * zeit = gmtime(&t);
 		sprintf(str, "[%02d:%02d:%02d] ",
 			zeit->tm_hour, zeit->tm_min, zeit->tm_sec);
 		std::string out(str);
 
-		// Arguments
 		vsprintf(str, fmt, args);
 		out += str;
 
-		// Write to file
 		out += "\n";
 		fprintf(traceFile, "%s", out.c_str());
 
