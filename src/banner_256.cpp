@@ -30,10 +30,10 @@
 // Managed owners remain resident until a genuinely different K>0 owner replaces
 // them or the UNIT_STATE itself is LRU-recycled; no time-based expiry is used.
 //
-// Targeted association diagnostics retain the exact COMMIT -> PROPAGATE ->
-// CAPTURE provenance for each entry mapping. Once the first managed K>0 unit is
-// known, COMMIT/PROP logging is limited to +/-8 real unit-array strides (0x628),
-// keeping melee traces small while exposing deterministic neighbouring-slot leaks.
+// Targeted association diagnostics retain the exact ARM -> COMMIT -> PROPAGATE ->
+// CAPTURE provenance for each entry mapping. ARM records both the EBP parent unit
+// and the current member record's +0x40 owner reference (ownerRef-0x86 trueUnit),
+// but diagnostic data does not change which unit receives Stage11 correction.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -126,6 +126,11 @@ namespace banner_256
         DWORD commitUnit;
         DWORD commitSequence;
         DWORD propagateSequence;
+        DWORD armSequence;
+        DWORD armParentUnit;
+        DWORD armMember;
+        DWORD armOwnerRef;
+        DWORD armTrueUnit;
     };
 
     struct OWNER_K_CACHE
@@ -149,6 +154,10 @@ namespace banner_256
     static BYTE* g_caves = NULL;
     static BOOL g_loaded = FALSE;
     static volatile DWORD g_pendingBodyUnit = 0;
+    static volatile DWORD g_pendingArmSequence = 0;
+    static volatile DWORD g_pendingArmMember = 0;
+    static volatile DWORD g_pendingArmOwnerRef = 0;
+    static volatile DWORD g_pendingArmTrueUnit = 0;
     static volatile DWORD g_projectionWScratchBits = 0;
     static volatile DWORD g_currentProjectionUnit = 0;
     static volatile DWORD g_lastProjectionUnit = 0;
@@ -408,12 +417,55 @@ namespace banner_256
         return &g_entryToUnit[slot];
     }
 
-    static void __cdecl ArmBodyUnit(DWORD unit) { g_pendingBodyUnit = 0; g_pendingBodyUnit = unit; }
+    static void ClearPendingArm()
+    {
+        g_pendingBodyUnit = 0;
+        g_pendingArmSequence = 0;
+        g_pendingArmMember = 0;
+        g_pendingArmOwnerRef = 0;
+        g_pendingArmTrueUnit = 0;
+    }
+
+    static void __cdecl ArmBodyUnit(DWORD parentUnit, DWORD memberRecord)
+    {
+        ClearPendingArm();
+        if (parentUnit == 0) return;
+
+        DWORD ownerRef = 0;
+        DWORD trueUnit = 0;
+        if (memberRecord >= 0x10000)
+        {
+            ownerRef = *((DWORD*)(memberRecord + 0x40));
+            if (ownerRef >= 0x86)
+                trueUnit = ownerRef - 0x86;
+        }
+
+        g_pendingBodyUnit = parentUnit;
+        g_pendingArmSequence = NextAssocSequence();
+        g_pendingArmMember = memberRecord;
+        g_pendingArmOwnerRef = ownerRef;
+        g_pendingArmTrueUnit = trueUnit;
+
+        if ((g_firstManagedUnit != 0 &&
+             (IsNearManagedUnit(parentUnit) || IsNearManagedUnit(trueUnit))) ||
+            (trueUnit != 0 && trueUnit != parentUnit))
+        {
+            darkomen::detour::trace(
+                "Stage11 assoc ARM seq=%lu parentUnit=%08lX parentStride=%ld member=%08lX ownerRef=%08lX trueUnit=%08lX trueStride=%ld",
+                (DWORD)g_pendingArmSequence, parentUnit, UnitStrideDelta(parentUnit),
+                memberRecord, ownerRef, trueUnit, UnitStrideDelta(trueUnit));
+            FlushTrace();
+        }
+    }
 
     static void __cdecl CommitBodyEntry(DWORD entry)
     {
         const DWORD unit = g_pendingBodyUnit;
-        g_pendingBodyUnit = 0;
+        const DWORD armSequence = g_pendingArmSequence;
+        const DWORD armMember = g_pendingArmMember;
+        const DWORD armOwnerRef = g_pendingArmOwnerRef;
+        const DWORD armTrueUnit = g_pendingArmTrueUnit;
+        ClearPendingArm();
         if (entry == 0 || unit == 0) return;
         ENTRY_UNIT_LINK* link = RecordEntryUnit(entry, unit);
         if (link == NULL) return;
@@ -421,14 +473,23 @@ namespace banner_256
         link->commitUnit = unit;
         link->commitSequence = NextAssocSequence();
         link->propagateSequence = 0;
-        if (IsNearManagedUnit(unit))
+        link->armSequence = armSequence;
+        link->armParentUnit = unit;
+        link->armMember = armMember;
+        link->armOwnerRef = armOwnerRef;
+        link->armTrueUnit = armTrueUnit;
+        if (IsNearManagedUnit(unit) || IsNearManagedUnit(armTrueUnit))
         {
-            darkomen::detour::trace("Stage11 assoc COMMIT seq=%lu entry=%08lX unit=%08lX stride=%ld", link->commitSequence, entry, unit, UnitStrideDelta(unit));
+            darkomen::detour::trace(
+                "Stage11 assoc COMMIT seq=%lu entry=%08lX unit=%08lX stride=%ld armSeq=%lu member=%08lX trueUnit=%08lX trueStride=%ld",
+                link->commitSequence, entry, unit, UnitStrideDelta(unit),
+                link->armSequence, link->armMember, link->armTrueUnit,
+                UnitStrideDelta(link->armTrueUnit));
             FlushTrace();
         }
     }
 
-    static void __cdecl ClearPendingBodyUnit() { g_pendingBodyUnit = 0; }
+    static void __cdecl ClearPendingBodyUnit() { ClearPendingArm(); }
 
     static DWORD FindUnitForEntry(DWORD entry)
     {
@@ -453,9 +514,19 @@ namespace banner_256
         body->commitUnit = (source->commitUnit != 0) ? source->commitUnit : source->unit;
         body->commitSequence = source->commitSequence;
         body->propagateSequence = NextAssocSequence();
-        if (IsNearManagedUnit(unit))
+        body->armSequence = source->armSequence;
+        body->armParentUnit = source->armParentUnit;
+        body->armMember = source->armMember;
+        body->armOwnerRef = source->armOwnerRef;
+        body->armTrueUnit = source->armTrueUnit;
+        if (IsNearManagedUnit(unit) || IsNearManagedUnit(body->armTrueUnit))
         {
-            darkomen::detour::trace("Stage11 assoc PROP seq=%lu source=%08lX mappedUnit=%08lX stride=%ld body=%08lX commitSeq=%lu commitUnit=%08lX", body->propagateSequence, sourceEntry, unit, UnitStrideDelta(unit), bodyEntry, body->commitSequence, body->commitUnit);
+            darkomen::detour::trace(
+                "Stage11 assoc PROP seq=%lu source=%08lX mappedUnit=%08lX stride=%ld body=%08lX commitSeq=%lu commitUnit=%08lX armSeq=%lu parent=%08lX member=%08lX trueUnit=%08lX trueStride=%ld",
+                body->propagateSequence, sourceEntry, unit, UnitStrideDelta(unit),
+                bodyEntry, body->commitSequence, body->commitUnit,
+                body->armSequence, body->armParentUnit, body->armMember,
+                body->armTrueUnit, UnitStrideDelta(body->armTrueUnit));
             FlushTrace();
         }
     }
@@ -498,12 +569,19 @@ namespace banner_256
         if (g_firstManagedUnit == 0) g_firstManagedUnit = unit;
         const DWORD captureSequence = NextAssocSequence();
         darkomen::detour::trace(
-            "Stage11 assoc CAPTURE seq=%lu body=%08lX mappedUnit=%08lX stride=%ld owner=%08lX source=%08lX commitSeq=%lu commitUnit=%08lX propSeq=%lu",
+            "Stage11 assoc CAPTURE seq=%lu body=%08lX mappedUnit=%08lX stride=%ld owner=%08lX source=%08lX commitSeq=%lu commitUnit=%08lX propSeq=%lu armSeq=%lu parent=%08lX parentStride=%ld member=%08lX ownerRef=%08lX trueUnit=%08lX trueStride=%ld",
             captureSequence, entry, unit, UnitStrideDelta(unit), owner,
             (bodyLink != NULL) ? bodyLink->sourceEntry : 0,
             (bodyLink != NULL) ? bodyLink->commitSequence : 0,
             (bodyLink != NULL) ? bodyLink->commitUnit : 0,
-            (bodyLink != NULL) ? bodyLink->propagateSequence : 0);
+            (bodyLink != NULL) ? bodyLink->propagateSequence : 0,
+            (bodyLink != NULL) ? bodyLink->armSequence : 0,
+            (bodyLink != NULL) ? bodyLink->armParentUnit : 0,
+            (bodyLink != NULL) ? UnitStrideDelta(bodyLink->armParentUnit) : 0x7FFFFFFF,
+            (bodyLink != NULL) ? bodyLink->armMember : 0,
+            (bodyLink != NULL) ? bodyLink->armOwnerRef : 0,
+            (bodyLink != NULL) ? bodyLink->armTrueUnit : 0,
+            (bodyLink != NULL) ? UnitStrideDelta(bodyLink->armTrueUnit) : 0x7FFFFFFF);
         FlushTrace();
 
         if (state->spriteOwner != 0 && state->spriteOwner != owner)
@@ -695,7 +773,7 @@ namespace banner_256
         BYTE* g = g_caves + 0x180; n = 0;
         g[n++] = 0x89; g[n++] = 0x35; *((DWORD*)(g + n)) = (DWORD)&g_currentProjectionUnit; n += 4; DWORD callG = n; g[n++] = 0xE8; n += 4; DWORD jumpG = n; g[n++] = 0xE9; n += 4; WriteRel32(g + callG, CALL_PROJECT_BUFFER); WriteRel32(g + jumpG, RETURN_PROJECTION_G);
         BYTE* arm = g_caves + 0x1C0; n = 0;
-        arm[n++] = 0x8D; arm[n++] = 0x44; arm[n++] = 0x24; arm[n++] = 0x1C; arm[n++] = 0x50; arm[n++] = 0x9C; arm[n++] = 0x60; arm[n++] = 0x55; DWORD callArm = n; arm[n++] = 0xE8; n += 4; arm[n++] = 0x83; arm[n++] = 0xC4; arm[n++] = 0x04; arm[n++] = 0x61; arm[n++] = 0x9D; DWORD jumpArm = n; arm[n++] = 0xE9; n += 4; WriteRel32(arm + callArm, (DWORD)&ArmBodyUnit); WriteRel32(arm + jumpArm, RETURN_BODY_ARM);
+        arm[n++] = 0x8D; arm[n++] = 0x44; arm[n++] = 0x24; arm[n++] = 0x1C; arm[n++] = 0x50; arm[n++] = 0x9C; arm[n++] = 0x60; arm[n++] = 0x56; arm[n++] = 0x55; DWORD callArm = n; arm[n++] = 0xE8; n += 4; arm[n++] = 0x83; arm[n++] = 0xC4; arm[n++] = 0x08; arm[n++] = 0x61; arm[n++] = 0x9D; DWORD jumpArm = n; arm[n++] = 0xE9; n += 4; WriteRel32(arm + callArm, (DWORD)&ArmBodyUnit); WriteRel32(arm + jumpArm, RETURN_BODY_ARM);
         BYTE* clear = g_caves + 0x200; n = 0;
         clear[n++] = 0x83; clear[n++] = 0xC4; clear[n++] = 0x04; clear[n++] = 0x9C; clear[n++] = 0x60; DWORD callClear = n; clear[n++] = 0xE8; n += 4; clear[n++] = 0x61; clear[n++] = 0x9D; DWORD jumpClear = n; clear[n++] = 0xE9; n += 4; WriteRel32(clear + callClear, (DWORD)&ClearPendingBodyUnit); WriteRel32(clear + jumpClear, RETURN_BODY_CLEAR);
         BYTE* commit = g_caves + 0x240; n = 0;
@@ -716,7 +794,7 @@ namespace banner_256
         memset(g_units, 0, sizeof(g_units));
         memset(g_entryToUnit, 0, sizeof(g_entryToUnit));
         memset(g_ownerK, 0, sizeof(g_ownerK));
-        g_pendingBodyUnit = 0;
+        ClearPendingArm();
         g_projectionWScratchBits = 0;
         g_currentProjectionUnit = 0;
         g_lastProjectionUnit = 0;
@@ -738,7 +816,7 @@ namespace banner_256
         WriteJump(HOOK_QUEUE_COMMIT, (DWORD)(g_caves + 0x240), 7);
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
         g_loaded = TRUE;
-        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + targeted association provenance trace");
+        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + ARM member-owner back-pointer diagnostics");
         FlushTrace();
     }
 
@@ -761,7 +839,7 @@ namespace banner_256
         memset(g_units, 0, sizeof(g_units));
         memset(g_entryToUnit, 0, sizeof(g_entryToUnit));
         memset(g_ownerK, 0, sizeof(g_ownerK));
-        g_pendingBodyUnit = 0;
+        ClearPendingArm();
         g_projectionWScratchBits = 0;
         g_currentProjectionUnit = 0;
         g_lastProjectionUnit = 0;
