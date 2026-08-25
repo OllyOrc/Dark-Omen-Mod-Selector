@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <ctime>
+#include <cstring>
 #include <string>
 #include "detour.h"
 #include <windows.h>
@@ -11,6 +12,10 @@ namespace detour {
 	bool traceEnabled = false;
 	FILE* traceFile = NULL;
 	char darkomenExePath[MAX_PATH + 1] = {0};
+
+	// Stage11 diagnostics are intentionally dormant now that the banner work has
+	// completed validation. Set this to true when Stage11 tracing is needed again.
+	static const bool stage11TraceEnabled = false;
 
 	void hookFunc(void* hookFunc, int addr)
 	{
@@ -40,33 +45,39 @@ namespace detour {
 
 	void trace(char* fmt, ...)
 	{
-		if (traceEnabled)
-		{
-			va_list args;
-			va_start(args, fmt);
+		if (!traceEnabled)
+			return;
 
-			char str[512];
-			// Get current time
-			time_t t = time(NULL);
-			struct tm * zeit = gmtime(&t);
-			sprintf(str, "[%02d:%02d:%02d] ",
-				zeit->tm_hour, zeit->tm_min, zeit->tm_sec);
-			std::string out(str);
+		// Keep the Stage11 instrumentation in the source for future diagnostics,
+		// but do not write it to trace.txt during normal play. This early return
+		// also avoids formatting and file-I/O cost for every Stage11 event.
+		if (!stage11TraceEnabled && fmt != NULL && strncmp(fmt, "Stage11 ", 8) == 0)
+			return;
 
-			// Arguments
-			vsprintf(str, fmt, args);
-			out += str;
+		va_list args;
+		va_start(args, fmt);
 
-			// Write to file
-			out += "\n";
-			fprintf(traceFile, "%s", out.c_str());
+		char str[512];
+		// Get current time
+		time_t t = time(NULL);
+		struct tm * zeit = gmtime(&t);
+		sprintf(str, "[%02d:%02d:%02d] ",
+			zeit->tm_hour, zeit->tm_min, zeit->tm_sec);
+		std::string out(str);
 
-			if (IsDebuggerPresent()) {
-				OutputDebugString(out.c_str());
-			}
+		// Arguments
+		vsprintf(str, fmt, args);
+		out += str;
 
-			va_end(args);
+		// Write to file
+		out += "\n";
+		fprintf(traceFile, "%s", out.c_str());
+
+		if (IsDebuggerPresent()) {
+			OutputDebugString(out.c_str());
 		}
+
+		va_end(args);
 	}
 }
 }
