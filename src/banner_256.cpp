@@ -30,10 +30,10 @@
 // Managed owners remain resident until a genuinely different K>0 owner replaces
 // them or the UNIT_STATE itself is LRU-recycled; no time-based expiry is used.
 //
-// Targeted diagnostics now snapshot the source-entry WORD at Hook Commit and
-// compare it with the same queue slot at PROP, while carrying the already-tested
-// ARM parent/member/back-pointer identity. This tests queue-entry content lifetime
-// without changing propagation or banner behaviour.
+// Targeted diagnostics now snapshot WORD +0x00 from pushIconDrawRecord's fully
+// populated source record (ESI) at Hook Commit, then compare it with WORD +0x00
+// from the resulting queue slot at PROP. The ARM parent/member/back-pointer
+// identity is carried alongside this without changing propagation or banners.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -134,6 +134,7 @@ namespace banner_256
         DWORD armTrueUnit;
         DWORD ownerAtProp;
         DWORD frameAtProp;
+        DWORD sourceRecordAtCommit;
         DWORD sourceTypeAtCommit;
         DWORD sourceTypeAtProp;
     };
@@ -452,7 +453,7 @@ namespace banner_256
         g_pendingArmTrueUnit = trueUnit;
     }
 
-    static void __cdecl CommitBodyEntry(DWORD entry)
+    static void __cdecl CommitBodyEntry(DWORD entry, DWORD sourceRecord)
     {
         const DWORD unit = g_pendingBodyUnit;
         const DWORD armSequence = g_pendingArmSequence;
@@ -474,7 +475,8 @@ namespace banner_256
         link->armTrueUnit = armTrueUnit;
         link->ownerAtProp = 0;
         link->frameAtProp = 0;
-        link->sourceTypeAtCommit = (DWORD)(*((WORD*)entry));
+        link->sourceRecordAtCommit = sourceRecord;
+        link->sourceTypeAtCommit = (sourceRecord != 0) ? (DWORD)(*((WORD*)sourceRecord)) : 0;
         link->sourceTypeAtProp = 0;
     }
 
@@ -510,6 +512,7 @@ namespace banner_256
         body->armTrueUnit = source->armTrueUnit;
         body->ownerAtProp = *((DWORD*)bodyEntry);
         body->frameAtProp = *((DWORD*)(bodyEntry + 0x04));
+        body->sourceRecordAtCommit = source->sourceRecordAtCommit;
         body->sourceTypeAtCommit = source->sourceTypeAtCommit;
         body->sourceTypeAtProp = (DWORD)(*((WORD*)sourceEntry));
     }
@@ -559,10 +562,10 @@ namespace banner_256
             const BOOL ownerMatch = (memberOwner != 0 && memberOwner == unit);
             const BOOL typeChanged = (commitType != propType);
             darkomen::detour::trace(
-                "Stage11 sourceFlow unit=%08lX stride=%ld member=%08lX ownerRef=%08lX memberOwner=%08lX ownerMatch=%d sourceEntry=%08lX commitType=%04X propType=%04X typeChanged=%d bodyEntry=%08lX bodyResource=%08lX",
+                "Stage11 sourceFlow unit=%08lX stride=%ld member=%08lX ownerRef=%08lX memberOwner=%08lX ownerMatch=%d sourceRecord=%08lX sourceEntry=%08lX commitType=%04X propType=%04X typeChanged=%d bodyEntry=%08lX bodyResource=%08lX",
                 unit, stride, bodyLink->armMember, bodyLink->armOwnerRef, memberOwner, ownerMatch ? 1 : 0,
-                bodyLink->sourceEntry, (unsigned int)commitType, (unsigned int)propType, typeChanged ? 1 : 0,
-                entry, owner);
+                bodyLink->sourceRecordAtCommit, bodyLink->sourceEntry, (unsigned int)commitType, (unsigned int)propType,
+                typeChanged ? 1 : 0, entry, owner);
             FlushTrace();
             state->loggedSourceFlow = TRUE;
         }
@@ -760,7 +763,7 @@ namespace banner_256
         BYTE* clear = g_caves + 0x200; n = 0;
         clear[n++] = 0x83; clear[n++] = 0xC4; clear[n++] = 0x04; clear[n++] = 0x9C; clear[n++] = 0x60; DWORD callClear = n; clear[n++] = 0xE8; n += 4; clear[n++] = 0x61; clear[n++] = 0x9D; DWORD jumpClear = n; clear[n++] = 0xE9; n += 4; WriteRel32(clear + callClear, (DWORD)&ClearPendingBodyUnit); WriteRel32(clear + jumpClear, RETURN_BODY_CLEAR);
         BYTE* commit = g_caves + 0x240; n = 0;
-        commit[n++] = 0xA1; *((DWORD*)(commit + n)) = 0x00567DE4; n += 4; commit[n++] = 0x03; commit[n++] = 0xF8; commit[n++] = 0x9C; commit[n++] = 0x60; commit[n++] = 0x57; DWORD callCommit = n; commit[n++] = 0xE8; n += 4; commit[n++] = 0x83; commit[n++] = 0xC4; commit[n++] = 0x04; commit[n++] = 0x61; commit[n++] = 0x9D; DWORD jumpCommit = n; commit[n++] = 0xE9; n += 4; WriteRel32(commit + callCommit, (DWORD)&CommitBodyEntry); WriteRel32(commit + jumpCommit, RETURN_QUEUE_COMMIT);
+        commit[n++] = 0xA1; *((DWORD*)(commit + n)) = 0x00567DE4; n += 4; commit[n++] = 0x03; commit[n++] = 0xF8; commit[n++] = 0x9C; commit[n++] = 0x60; commit[n++] = 0x56; commit[n++] = 0x57; DWORD callCommit = n; commit[n++] = 0xE8; n += 4; commit[n++] = 0x83; commit[n++] = 0xC4; commit[n++] = 0x08; commit[n++] = 0x61; commit[n++] = 0x9D; DWORD jumpCommit = n; commit[n++] = 0xE9; n += 4; WriteRel32(commit + callCommit, (DWORD)&CommitBodyEntry); WriteRel32(commit + jumpCommit, RETURN_QUEUE_COMMIT);
         FlushInstructionCache(GetCurrentProcess(), g_caves, 0x300);
         return TRUE;
     }
@@ -768,7 +771,7 @@ namespace banner_256
     void Load()
     {
         if (g_loaded) return;
-        if (!BytesEqual(HOOK_CLASSIFY, kOriginalClassify, sizeof(kOriginalClassify)) || !BytesEqual(HOOK_ENTRY, kOriginalEntry, sizeof(kOriginalEntry)) || !BytesEqual(HOOK_RENDER, kOriginalRender, sizeof(kOriginalRender)) || !BytesEqual(HOOK_PROJECTION_E, kOriginalProjectionE, sizeof(kOriginalProjectionE)) || !BytesEqual(HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjectionF)) || !BytesEqual(HOOK_PROJECTION_G, kOriginalProjectionG, sizeof(kOriginalProjectionG)) || !BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)) || !BytesEqual(HOOK_BODY_ARM, kOriginalBodyArm, sizeof(kOriginalBodyArm)) || !BytesEqual(HOOK_BODY_CLEAR, kOriginalBodyClear, sizeof(kOriginalBodyClear)) || !BytesEqual(HOOK_QUEUE_COMMIT, kOriginalQueueCommit, sizeof(kOriginalQueueCommit)))
+        if (!BytesEqual(HOOK_CLASSIFY, kOriginalClassify, sizeof(kOriginalClassify)) || !BytesEqual(HOOK_ENTRY, kOriginalEntry, sizeof(kOriginalEntry)) || !BytesEqual(HOOK_RENDER, kOriginalRender, sizeof(kOriginalRender)) || !BytesEqual(HOOK_PROJECTION_E, kOriginalProjectionE, sizeof(kOriginalProjection_E)) || !BytesEqual(HOOK_PROJECTION_F, kOriginalProjectionF, sizeof(kOriginalProjectionF)) || !BytesEqual(HOOK_PROJECTION_G, kOriginalProjectionG, sizeof(kOriginalProjectionG)) || !BytesEqual(HOOK_ANCHOR, kOriginalAnchor, sizeof(kOriginalAnchor)) || !BytesEqual(HOOK_BODY_ARM, kOriginalBodyArm, sizeof(kOriginalBodyArm)) || !BytesEqual(HOOK_BODY_CLEAR, kOriginalBodyClear, sizeof(kOriginalBodyClear)) || !BytesEqual(HOOK_QUEUE_COMMIT, kOriginalQueueCommit, sizeof(kOriginalQueueCommit)))
         {
             darkomen::detour::trace("Stage11 install FAIL byte guard");
             FlushTrace();
@@ -799,7 +802,7 @@ namespace banner_256
         WriteJump(HOOK_QUEUE_COMMIT, (DWORD)(g_caves + 0x240), 7);
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
         g_loaded = TRUE;
-        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + source-flow diagnostic");
+        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + source-flow ESI diagnostic");
         FlushTrace();
     }
 
