@@ -29,6 +29,11 @@
 // incidental zero-K body owners cannot repeatedly reset an enlarged unit's state.
 // Managed owners remain resident until a genuinely different K>0 owner replaces
 // them or the UNIT_STATE itself is LRU-recycled; no time-based expiry is used.
+//
+// Targeted association diagnostics retain the exact COMMIT -> PROPAGATE ->
+// CAPTURE provenance for each entry mapping. Once the first managed K>0 unit is
+// known, COMMIT/PROP logging is limited to +/-8 real unit-array strides (0x628),
+// keeping melee traces small while exposing deterministic neighbouring-slot leaks.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -42,7 +47,6 @@ namespace banner_256
     static const DWORD HOOK_PROJECTION_F   = 0x0043FE24;
     static const DWORD HOOK_PROJECTION_G   = 0x00450427;
     static const DWORD HOOK_ANCHOR         = 0x004504B8;
-
     static const DWORD HOOK_BODY_ARM       = 0x00469C34;
     static const DWORD HOOK_BODY_CLEAR     = 0x00469C3E;
     static const DWORD HOOK_QUEUE_COMMIT   = 0x0045226D;
@@ -60,6 +64,7 @@ namespace banner_256
 
     static const DWORD CALL_PROJECT_BUFFER = 0x00427C30;
     static const DWORD BOUNDS_REFRESH_COOLDOWN = 0x004E4A00;
+    static const DWORD UNIT_ARRAY_STRIDE = 0x628;
 
     static const BYTE kOriginalClassify[5] = { 0x8B,0x6F,0x48,0x85,0xED };
     static const BYTE kOriginalEntry[7] = { 0xC7,0x45,0x10,0x00,0x00,0x00,0x00 };
@@ -112,7 +117,16 @@ namespace banner_256
         DWORD lastTouch;
     };
 
-    struct ENTRY_UNIT_LINK { DWORD entry; DWORD unit; DWORD lastTouch; };
+    struct ENTRY_UNIT_LINK
+    {
+        DWORD entry;
+        DWORD unit;
+        DWORD lastTouch;
+        DWORD sourceEntry;
+        DWORD commitUnit;
+        DWORD commitSequence;
+        DWORD propagateSequence;
+    };
 
     struct OWNER_K_CACHE
     {
@@ -141,6 +155,8 @@ namespace banner_256
     static volatile DWORD g_lastProjectionWBits = 0;
     static volatile DWORD g_projectionSequence = 0;
     static DWORD g_touchCounter = 0;
+    static DWORD g_assocSequence = 0;
+    static DWORD g_firstManagedUnit = 0;
 
     static float ContinuousAnchorK(float top);
     static float GetAnchorK(const UNIT_STATE* state);
@@ -157,6 +173,27 @@ namespace banner_256
         ++g_touchCounter;
         if (g_touchCounter == 0) ++g_touchCounter;
         return g_touchCounter;
+    }
+
+    static DWORD NextAssocSequence()
+    {
+        ++g_assocSequence;
+        if (g_assocSequence == 0) ++g_assocSequence;
+        return g_assocSequence;
+    }
+
+    static LONG UnitStrideDelta(DWORD unit)
+    {
+        if (g_firstManagedUnit == 0 || unit == 0) return 0x7FFFFFFF;
+        const LONG deltaBytes = (LONG)(unit - g_firstManagedUnit);
+        if ((deltaBytes % (LONG)UNIT_ARRAY_STRIDE) != 0) return 0x7FFFFFFF;
+        return deltaBytes / (LONG)UNIT_ARRAY_STRIDE;
+    }
+
+    static BOOL IsNearManagedUnit(DWORD unit)
+    {
+        const LONG stride = UnitStrideDelta(unit);
+        return stride != 0x7FFFFFFF && stride >= -8 && stride <= 8;
     }
 
     static void ForceBoundsRefresh(DWORD unit, const char* reason)
@@ -324,9 +361,23 @@ namespace banner_256
         }
     }
 
-    static void __cdecl RecordEntryUnit(DWORD entry, DWORD unit)
+    static ENTRY_UNIT_LINK* FindEntryLink(DWORD entry)
     {
-        if (entry == 0 || unit == 0) return;
+        if (entry == 0) return NULL;
+        for (DWORD i = 0; i < _countof(g_entryToUnit); ++i)
+        {
+            if (g_entryToUnit[i].entry == entry)
+            {
+                g_entryToUnit[i].lastTouch = NextTouchStamp();
+                return &g_entryToUnit[i];
+            }
+        }
+        return NULL;
+    }
+
+    static ENTRY_UNIT_LINK* RecordEntryUnit(DWORD entry, DWORD unit)
+    {
+        if (entry == 0 || unit == 0) return NULL;
         DWORD freeSlot = _countof(g_entryToUnit), lruSlot = 0, lruStamp = 0xFFFFFFFF;
         for (DWORD i = 0; i < _countof(g_entryToUnit); ++i)
         {
@@ -334,7 +385,7 @@ namespace banner_256
             {
                 g_entryToUnit[i].unit = unit;
                 g_entryToUnit[i].lastTouch = NextTouchStamp();
-                return;
+                return &g_entryToUnit[i];
             }
             if (freeSlot == _countof(g_entryToUnit) && g_entryToUnit[i].entry == 0) freeSlot = i;
             if (g_entryToUnit[i].entry != 0 && g_entryToUnit[i].lastTouch < lruStamp)
@@ -350,32 +401,39 @@ namespace banner_256
             darkomen::detour::trace("Stage11 entryMap recycle slot=%lu oldEntry=%08lX oldUnit=%08lX newEntry=%08lX newUnit=%08lX", slot, g_entryToUnit[slot].entry, g_entryToUnit[slot].unit, entry, unit);
             FlushTrace();
         }
+        memset(&g_entryToUnit[slot], 0, sizeof(g_entryToUnit[slot]));
         g_entryToUnit[slot].entry = entry;
         g_entryToUnit[slot].unit = unit;
         g_entryToUnit[slot].lastTouch = NextTouchStamp();
+        return &g_entryToUnit[slot];
     }
 
     static void __cdecl ArmBodyUnit(DWORD unit) { g_pendingBodyUnit = 0; g_pendingBodyUnit = unit; }
+
     static void __cdecl CommitBodyEntry(DWORD entry)
     {
         const DWORD unit = g_pendingBodyUnit;
         g_pendingBodyUnit = 0;
-        if (entry != 0 && unit != 0) RecordEntryUnit(entry, unit);
+        if (entry == 0 || unit == 0) return;
+        ENTRY_UNIT_LINK* link = RecordEntryUnit(entry, unit);
+        if (link == NULL) return;
+        link->sourceEntry = entry;
+        link->commitUnit = unit;
+        link->commitSequence = NextAssocSequence();
+        link->propagateSequence = 0;
+        if (IsNearManagedUnit(unit))
+        {
+            darkomen::detour::trace("Stage11 assoc COMMIT seq=%lu entry=%08lX unit=%08lX stride=%ld", link->commitSequence, entry, unit, UnitStrideDelta(unit));
+            FlushTrace();
+        }
     }
+
     static void __cdecl ClearPendingBodyUnit() { g_pendingBodyUnit = 0; }
 
     static DWORD FindUnitForEntry(DWORD entry)
     {
-        if (entry == 0) return 0;
-        for (DWORD i = 0; i < _countof(g_entryToUnit); ++i)
-        {
-            if (g_entryToUnit[i].entry == entry)
-            {
-                g_entryToUnit[i].lastTouch = NextTouchStamp();
-                return g_entryToUnit[i].unit;
-            }
-        }
-        return 0;
+        ENTRY_UNIT_LINK* link = FindEntryLink(entry);
+        return (link != NULL) ? link->unit : 0;
     }
 
     static void __cdecl MarkTrustedUnitClass(DWORD sourceEntry, DWORD templateEntry)
@@ -386,8 +444,20 @@ namespace banner_256
 
     static void __cdecl PropagateTrustedEntry(DWORD bodyEntry, DWORD sourceEntry)
     {
-        const DWORD unit = FindUnitForEntry(sourceEntry);
-        if (unit != 0 && bodyEntry != 0) RecordEntryUnit(bodyEntry, unit);
+        ENTRY_UNIT_LINK* source = FindEntryLink(sourceEntry);
+        const DWORD unit = (source != NULL) ? source->unit : 0;
+        if (unit == 0 || bodyEntry == 0) return;
+        ENTRY_UNIT_LINK* body = RecordEntryUnit(bodyEntry, unit);
+        if (body == NULL) return;
+        body->sourceEntry = sourceEntry;
+        body->commitUnit = (source->commitUnit != 0) ? source->commitUnit : source->unit;
+        body->commitSequence = source->commitSequence;
+        body->propagateSequence = NextAssocSequence();
+        if (IsNearManagedUnit(unit))
+        {
+            darkomen::detour::trace("Stage11 assoc PROP seq=%lu source=%08lX mappedUnit=%08lX stride=%ld body=%08lX commitSeq=%lu commitUnit=%08lX", body->propagateSequence, sourceEntry, unit, UnitStrideDelta(unit), bodyEntry, body->commitSequence, body->commitUnit);
+            FlushTrace();
+        }
     }
 
     static void ResetUnitStateForOwnerReuse(UNIT_STATE* state, DWORD newOwner)
@@ -410,7 +480,8 @@ namespace banner_256
 
     static void __cdecl CaptureBodyTopExtent(DWORD entry)
     {
-        const DWORD unit = FindUnitForEntry(entry);
+        ENTRY_UNIT_LINK* bodyLink = FindEntryLink(entry);
+        const DWORD unit = (bodyLink != NULL) ? bodyLink->unit : 0;
         if (unit == 0 || entry == 0) return;
         UNIT_STATE* state = FindOrCreateUnitState(unit);
         if (state == NULL) return;
@@ -423,6 +494,17 @@ namespace banner_256
         OWNER_K_CACHE* ownerCache = ScanOwnerK(owner);
         if (ownerCache == NULL || !ownerCache->valid) return;
         if (ownerCache->cachedK <= 0.0f) return;
+
+        if (g_firstManagedUnit == 0) g_firstManagedUnit = unit;
+        const DWORD captureSequence = NextAssocSequence();
+        darkomen::detour::trace(
+            "Stage11 assoc CAPTURE seq=%lu body=%08lX mappedUnit=%08lX stride=%ld owner=%08lX source=%08lX commitSeq=%lu commitUnit=%08lX propSeq=%lu",
+            captureSequence, entry, unit, UnitStrideDelta(unit), owner,
+            (bodyLink != NULL) ? bodyLink->sourceEntry : 0,
+            (bodyLink != NULL) ? bodyLink->commitSequence : 0,
+            (bodyLink != NULL) ? bodyLink->commitUnit : 0,
+            (bodyLink != NULL) ? bodyLink->propagateSequence : 0);
+        FlushTrace();
 
         if (state->spriteOwner != 0 && state->spriteOwner != owner)
             ResetUnitStateForOwnerReuse(state, owner);
@@ -641,6 +723,8 @@ namespace banner_256
         g_lastProjectionWBits = 0;
         g_projectionSequence = 0;
         g_touchCounter = 0;
+        g_assocSequence = 0;
+        g_firstManagedUnit = 0;
         if (!BuildCaves()) return;
         WriteJump(HOOK_CLASSIFY, (DWORD)(g_caves + 0x00), 5);
         WriteJump(HOOK_ENTRY, (DWORD)(g_caves + 0x40), 7);
@@ -654,7 +738,7 @@ namespace banner_256
         WriteJump(HOOK_QUEUE_COMMIT, (DWORD)(g_caves + 0x240), 7);
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
         g_loaded = TRUE;
-        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout");
+        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + targeted association provenance trace");
         FlushTrace();
     }
 
@@ -684,6 +768,8 @@ namespace banner_256
         g_lastProjectionWBits = 0;
         g_projectionSequence = 0;
         g_touchCounter = 0;
+        g_assocSequence = 0;
+        g_firstManagedUnit = 0;
         g_loaded = FALSE;
     }
 }
