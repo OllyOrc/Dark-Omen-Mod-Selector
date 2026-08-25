@@ -30,10 +30,10 @@
 // Managed owners remain resident until a genuinely different K>0 owner replaces
 // them or the UNIT_STATE itself is LRU-recycled; no time-based expiry is used.
 //
-// Targeted diagnostics now snapshot the exact source-entry WORD consumed by
-// buildUnitBodySpriteDrawQueue and compare it with the mapped unit's canonical
-// unit+0x64 sprite type. This distinguishes genuine sprite records from the
-// live-battle 0x00ff decorative records without changing propagation behaviour.
+// Targeted diagnostics now snapshot the source-entry WORD at Hook Commit and
+// compare it with the same queue slot at PROP, while carrying the already-tested
+// ARM parent/member/back-pointer identity. This tests queue-entry content lifetime
+// without changing propagation or banner behaviour.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -107,8 +107,7 @@ namespace banner_256
         BOOL loggedRawFrame;
         BOOL loggedOwner;
         BOOL loggedImmediatePatch;
-        BOOL loggedSourceTypeMatch;
-        BOOL loggedSourceTypeMismatch;
+        BOOL loggedSourceFlow;
         int lastAppliedRaise;
         DWORD projectionWBits;
         DWORD projectionSequence;
@@ -135,6 +134,7 @@ namespace banner_256
         DWORD armTrueUnit;
         DWORD ownerAtProp;
         DWORD frameAtProp;
+        DWORD sourceTypeAtCommit;
         DWORD sourceTypeAtProp;
     };
 
@@ -474,6 +474,7 @@ namespace banner_256
         link->armTrueUnit = armTrueUnit;
         link->ownerAtProp = 0;
         link->frameAtProp = 0;
+        link->sourceTypeAtCommit = (DWORD)(*((WORD*)entry));
         link->sourceTypeAtProp = 0;
     }
 
@@ -509,6 +510,7 @@ namespace banner_256
         body->armTrueUnit = source->armTrueUnit;
         body->ownerAtProp = *((DWORD*)bodyEntry);
         body->frameAtProp = *((DWORD*)(bodyEntry + 0x04));
+        body->sourceTypeAtCommit = source->sourceTypeAtCommit;
         body->sourceTypeAtProp = (DWORD)(*((WORD*)sourceEntry));
     }
 
@@ -549,21 +551,20 @@ namespace banner_256
 
         if (g_firstManagedUnit == 0) g_firstManagedUnit = unit;
         const LONG stride = UnitStrideDelta(unit);
-        if (stride != 0x7FFFFFFF && stride >= -8 && stride <= 8 && bodyLink != NULL)
+        if (stride != 0x7FFFFFFF && stride >= -8 && stride <= 8 && bodyLink != NULL && !state->loggedSourceFlow)
         {
-            const WORD sourceType = (WORD)bodyLink->sourceTypeAtProp;
-            const WORD unitType = *((WORD*)(unit + 0x64));
-            const BOOL match = (sourceType == unitType);
-            if ((match && !state->loggedSourceTypeMatch) || (!match && !state->loggedSourceTypeMismatch))
-            {
-                darkomen::detour::trace(
-                    "Stage11 sourceTypeCheck unit=%08lX stride=%ld sourceEntry=%08lX sourceType=%04X unitType=%04X bodyEntry=%08lX bodyResource=%08lX match=%d",
-                    unit, stride, bodyLink->sourceEntry, (unsigned int)sourceType, (unsigned int)unitType,
-                    entry, owner, match ? 1 : 0);
-                FlushTrace();
-                if (match) state->loggedSourceTypeMatch = TRUE;
-                else state->loggedSourceTypeMismatch = TRUE;
-            }
+            const WORD commitType = (WORD)bodyLink->sourceTypeAtCommit;
+            const WORD propType = (WORD)bodyLink->sourceTypeAtProp;
+            const DWORD memberOwner = bodyLink->armTrueUnit;
+            const BOOL ownerMatch = (memberOwner != 0 && memberOwner == unit);
+            const BOOL typeChanged = (commitType != propType);
+            darkomen::detour::trace(
+                "Stage11 sourceFlow unit=%08lX stride=%ld member=%08lX ownerRef=%08lX memberOwner=%08lX ownerMatch=%d sourceEntry=%08lX commitType=%04X propType=%04X typeChanged=%d bodyEntry=%08lX bodyResource=%08lX",
+                unit, stride, bodyLink->armMember, bodyLink->armOwnerRef, memberOwner, ownerMatch ? 1 : 0,
+                bodyLink->sourceEntry, (unsigned int)commitType, (unsigned int)propType, typeChanged ? 1 : 0,
+                entry, owner);
+            FlushTrace();
+            state->loggedSourceFlow = TRUE;
         }
 
         if (state->spriteOwner != 0 && state->spriteOwner != owner)
@@ -798,7 +799,7 @@ namespace banner_256
         WriteJump(HOOK_QUEUE_COMMIT, (DWORD)(g_caves + 0x240), 7);
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
         g_loaded = TRUE;
-        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + source-type diagnostic");
+        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + source-flow diagnostic");
         FlushTrace();
     }
 
