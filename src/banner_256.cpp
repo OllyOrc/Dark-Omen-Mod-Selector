@@ -21,6 +21,11 @@
 // rule derived from the validated native-147 reference: effective K per top
 // pixel is 3.6503. A further fixed +20px raise is applied only to those Stage11
 // enlarged sprites, leaving zero-K vanilla owners completely untouched.
+//
+// Stage11 state lives for the lifetime of EngRel.exe, while missions can be
+// loaded repeatedly without restarting the process. Entry/unit/owner tables are
+// therefore LRU-recycled when full, owner caches are revalidated against the
+// live frameBase/frameCount, and reused unit addresses are reset for new owners.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -121,12 +126,14 @@ namespace banner_256
         float lastRefreshK;
         float lastRefreshScale;
         BOOL hasRefreshSignature;
+        DWORD lastTouch;
     };
 
     struct ENTRY_UNIT_LINK
     {
         DWORD entry;
         DWORD unit;
+        DWORD lastTouch;
     };
 
     struct OWNER_K_CACHE
@@ -141,6 +148,7 @@ namespace banner_256
         float raiseScale;
         BOOL valid;
         BOOL logged;
+        DWORD lastTouch;
     };
 
     static UNIT_STATE g_units[400];
@@ -156,6 +164,7 @@ namespace banner_256
     static volatile DWORD g_lastProjectionUnit = 0;
     static volatile DWORD g_lastProjectionWBits = 0;
     static volatile DWORD g_projectionSequence = 0;
+    static DWORD g_touchCounter = 0;
 
     static float ContinuousAnchorK(float top);
     static float GetAnchorK(const UNIT_STATE* state);
@@ -166,6 +175,14 @@ namespace banner_256
     {
         if (darkomen::detour::traceFile != NULL)
             fflush(darkomen::detour::traceFile);
+    }
+
+    static DWORD NextTouchStamp()
+    {
+        ++g_touchCounter;
+        if (g_touchCounter == 0)
+            ++g_touchCounter;
+        return g_touchCounter;
     }
 
     static void ForceBoundsRefresh(DWORD unit, const char* reason)
@@ -204,37 +221,83 @@ namespace banner_256
         if (unit == 0) return NULL;
 
         DWORD freeSlot = _countof(g_units);
+        DWORD lruSlot = 0;
+        DWORD lruStamp = 0xFFFFFFFF;
+
         for (DWORD i = 0; i < _countof(g_units); ++i)
         {
-            if (g_units[i].unit == unit) return &g_units[i];
+            if (g_units[i].unit == unit)
+            {
+                g_units[i].lastTouch = NextTouchStamp();
+                return &g_units[i];
+            }
+
             if (freeSlot == _countof(g_units) && g_units[i].unit == 0)
                 freeSlot = i;
+
+            if (g_units[i].unit != 0 && g_units[i].lastTouch < lruStamp)
+            {
+                lruStamp = g_units[i].lastTouch;
+                lruSlot = i;
+            }
         }
 
-        if (freeSlot >= _countof(g_units)) return NULL;
-        memset(&g_units[freeSlot], 0, sizeof(g_units[freeSlot]));
-        g_units[freeSlot].unit = unit;
-        g_units[freeSlot].ownerRaiseScale = 1.0f;
-        return &g_units[freeSlot];
+        DWORD slot = freeSlot;
+        if (slot >= _countof(g_units))
+        {
+            slot = lruSlot;
+            darkomen::detour::trace(
+                "Stage11 unitState recycle slot=%lu oldUnit=%08lX newUnit=%08lX",
+                slot, g_units[slot].unit, unit);
+            FlushTrace();
+        }
+
+        memset(&g_units[slot], 0, sizeof(g_units[slot]));
+        g_units[slot].unit = unit;
+        g_units[slot].ownerRaiseScale = 1.0f;
+        g_units[slot].lastTouch = NextTouchStamp();
+        return &g_units[slot];
     }
 
     static OWNER_K_CACHE* FindOwnerCache(DWORD owner)
     {
         DWORD freeSlot = _countof(g_ownerK);
+        DWORD lruSlot = 0;
+        DWORD lruStamp = 0xFFFFFFFF;
+
         for (DWORD i = 0; i < _countof(g_ownerK); ++i)
         {
-            if (g_ownerK[i].valid && g_ownerK[i].owner == owner)
+            if (g_ownerK[i].owner == owner)
+            {
+                g_ownerK[i].lastTouch = NextTouchStamp();
                 return &g_ownerK[i];
+            }
 
-            if (freeSlot == _countof(g_ownerK) && !g_ownerK[i].valid)
+            if (freeSlot == _countof(g_ownerK) && g_ownerK[i].owner == 0)
                 freeSlot = i;
+
+            if (g_ownerK[i].owner != 0 && g_ownerK[i].lastTouch < lruStamp)
+            {
+                lruStamp = g_ownerK[i].lastTouch;
+                lruSlot = i;
+            }
         }
 
-        if (freeSlot >= _countof(g_ownerK)) return NULL;
-        memset(&g_ownerK[freeSlot], 0, sizeof(g_ownerK[freeSlot]));
-        g_ownerK[freeSlot].owner = owner;
-        g_ownerK[freeSlot].raiseScale = 1.0f;
-        return &g_ownerK[freeSlot];
+        DWORD slot = freeSlot;
+        if (slot >= _countof(g_ownerK))
+        {
+            slot = lruSlot;
+            darkomen::detour::trace(
+                "Stage11 ownerCache recycle slot=%lu oldOwner=%08lX newOwner=%08lX",
+                slot, g_ownerK[slot].owner, owner);
+            FlushTrace();
+        }
+
+        memset(&g_ownerK[slot], 0, sizeof(g_ownerK[slot]));
+        g_ownerK[slot].owner = owner;
+        g_ownerK[slot].raiseScale = 1.0f;
+        g_ownerK[slot].lastTouch = NextTouchStamp();
+        return &g_ownerK[slot];
     }
 
     static OWNER_K_CACHE* ScanOwnerK(DWORD owner)
@@ -243,12 +306,28 @@ namespace banner_256
 
         OWNER_K_CACHE* cache = FindOwnerCache(owner);
         if (cache == NULL) return NULL;
-        if (cache->valid) return cache;
 
         const DWORD frameCount = *((DWORD*)(owner + 0x08));
         const DWORD frameBase = *((DWORD*)(owner + 0x10));
         if (frameCount == 0 || frameCount > 4096 || frameBase == 0)
             return NULL;
+
+        if (cache->valid)
+        {
+            if (cache->frameBase == frameBase && cache->frameCount == frameCount)
+                return cache;
+
+            darkomen::detour::trace(
+                "Stage11 ownerCache invalidate owner=%08lX oldFrameBase=%08lX oldFrames=%lu newFrameBase=%08lX newFrames=%lu",
+                owner, cache->frameBase, cache->frameCount, frameBase, frameCount);
+            FlushTrace();
+
+            const DWORD touch = cache->lastTouch;
+            memset(cache, 0, sizeof(*cache));
+            cache->owner = owner;
+            cache->raiseScale = 1.0f;
+            cache->lastTouch = touch;
+        }
 
         DWORD maxWidth = 0;
         DWORD maxHeight = 0;
@@ -342,22 +421,42 @@ namespace banner_256
         if (entry == 0 || unit == 0) return;
 
         DWORD freeSlot = _countof(g_entryToUnit);
+        DWORD lruSlot = 0;
+        DWORD lruStamp = 0xFFFFFFFF;
+
         for (DWORD i = 0; i < _countof(g_entryToUnit); ++i)
         {
             if (g_entryToUnit[i].entry == entry)
             {
                 g_entryToUnit[i].unit = unit;
+                g_entryToUnit[i].lastTouch = NextTouchStamp();
                 return;
             }
+
             if (freeSlot == _countof(g_entryToUnit) && g_entryToUnit[i].entry == 0)
                 freeSlot = i;
+
+            if (g_entryToUnit[i].entry != 0 && g_entryToUnit[i].lastTouch < lruStamp)
+            {
+                lruStamp = g_entryToUnit[i].lastTouch;
+                lruSlot = i;
+            }
         }
 
-        if (freeSlot < _countof(g_entryToUnit))
+        DWORD slot = freeSlot;
+        if (slot >= _countof(g_entryToUnit))
         {
-            g_entryToUnit[freeSlot].entry = entry;
-            g_entryToUnit[freeSlot].unit = unit;
+            slot = lruSlot;
+            darkomen::detour::trace(
+                "Stage11 entryMap recycle slot=%lu oldEntry=%08lX oldUnit=%08lX newEntry=%08lX newUnit=%08lX",
+                slot, g_entryToUnit[slot].entry, g_entryToUnit[slot].unit,
+                entry, unit);
+            FlushTrace();
         }
+
+        g_entryToUnit[slot].entry = entry;
+        g_entryToUnit[slot].unit = unit;
+        g_entryToUnit[slot].lastTouch = NextTouchStamp();
     }
 
     static void __cdecl ArmBodyUnit(DWORD unit)
@@ -388,7 +487,13 @@ namespace banner_256
     {
         if (entry == 0) return 0;
         for (DWORD i = 0; i < _countof(g_entryToUnit); ++i)
-            if (g_entryToUnit[i].entry == entry) return g_entryToUnit[i].unit;
+        {
+            if (g_entryToUnit[i].entry == entry)
+            {
+                g_entryToUnit[i].lastTouch = NextTouchStamp();
+                return g_entryToUnit[i].unit;
+            }
+        }
         return 0;
     }
 
@@ -406,6 +511,29 @@ namespace banner_256
             RecordEntryUnit(bodyEntry, unit);
     }
 
+    static void ResetUnitStateForOwnerReuse(UNIT_STATE* state, DWORD newOwner)
+    {
+        if (state == NULL) return;
+
+        const DWORD unit = state->unit;
+        const DWORD resourceWidth = state->resourceWidth;
+        const DWORD resourceHeight = state->resourceHeight;
+        const DWORD oldOwner = state->spriteOwner;
+        const DWORD touch = state->lastTouch;
+
+        darkomen::detour::trace(
+            "Stage11 unitState ownerReuse unit=%08lX oldOwner=%08lX newOwner=%08lX",
+            unit, oldOwner, newOwner);
+        FlushTrace();
+
+        memset(state, 0, sizeof(*state));
+        state->unit = unit;
+        state->resourceWidth = resourceWidth;
+        state->resourceHeight = resourceHeight;
+        state->ownerRaiseScale = 1.0f;
+        state->lastTouch = touch;
+    }
+
     static void __cdecl CaptureBodyTopExtent(DWORD entry)
     {
         const DWORD unit = FindUnitForEntry(entry);
@@ -421,6 +549,9 @@ namespace banner_256
 
         const LONG frameIndex = *((LONG*)(entry + 0x04));
         if (frameIndex < 0 || frameIndex > 4096) return;
+
+        if (state->spriteOwner != 0 && state->spriteOwner != owner)
+            ResetUnitStateForOwnerReuse(state, owner);
 
         if (!state->loggedOwner)
         {
@@ -863,6 +994,7 @@ namespace banner_256
         g_lastProjectionUnit = 0;
         g_lastProjectionWBits = 0;
         g_projectionSequence = 0;
+        g_touchCounter = 0;
 
         if (!BuildCaves()) return;
 
@@ -881,7 +1013,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression active");
+            "Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling active");
         FlushTrace();
     }
 
@@ -915,6 +1047,7 @@ namespace banner_256
         g_lastProjectionUnit = 0;
         g_lastProjectionWBits = 0;
         g_projectionSequence = 0;
+        g_touchCounter = 0;
         g_loaded = FALSE;
     }
 }
