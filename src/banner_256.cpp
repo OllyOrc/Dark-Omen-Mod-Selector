@@ -16,6 +16,12 @@
 // downstream body-draw record, Hook C propagates only that trusted association;
 // it never reads the shared queue's accidental/stale entry+0x1c contents.
 //
+// Queue slots are reused by the game. Every default-queue commit therefore
+// invalidates any prior Stage11 mapping when no unit is armed, and Hook C also
+// rejects a mapping if WORD +0x00 no longer matches the value captured from the
+// fully-populated source record at commit time. This prevents a reused slot from
+// transferring an enlarged SPR owner to an unrelated vanilla unit.
+//
 // A newly discovered non-zero K forces bounds refresh once per genuinely new
 // (owner,K,scale) signature. Enlarged sprites use one proportional banner-gap
 // rule derived from the validated native-147 reference: effective K per top
@@ -29,11 +35,6 @@
 // incidental zero-K body owners cannot repeatedly reset an enlarged unit's state.
 // Managed owners remain resident until a genuinely different K>0 owner replaces
 // them or the UNIT_STATE itself is LRU-recycled; no time-based expiry is used.
-//
-// Targeted diagnostics now snapshot WORD +0x00 from pushIconDrawRecord's fully
-// populated source record (ESI) at Hook Commit, then compare it with WORD +0x00
-// from the resulting queue slot at PROP. The ARM parent/member/back-pointer
-// identity is carried alongside this without changing propagation or banners.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -390,6 +391,19 @@ namespace banner_256
         return NULL;
     }
 
+    static void InvalidateEntryLink(DWORD entry)
+    {
+        if (entry == 0) return;
+        for (DWORD i = 0; i < _countof(g_entryToUnit); ++i)
+        {
+            if (g_entryToUnit[i].entry == entry)
+            {
+                memset(&g_entryToUnit[i], 0, sizeof(g_entryToUnit[i]));
+                return;
+            }
+        }
+    }
+
     static ENTRY_UNIT_LINK* RecordEntryUnit(DWORD entry, DWORD unit)
     {
         if (entry == 0 || unit == 0) return NULL;
@@ -461,7 +475,18 @@ namespace banner_256
         const DWORD armOwnerRef = g_pendingArmOwnerRef;
         const DWORD armTrueUnit = g_pendingArmTrueUnit;
         ClearPendingArm();
-        if (entry == 0 || unit == 0) return;
+        if (entry == 0) return;
+        if (unit == 0)
+        {
+            ENTRY_UNIT_LINK* stale = FindEntryLink(entry);
+            if (stale != NULL)
+            {
+                darkomen::detour::trace("Stage11 unarmedCommitInvalidate entry=%08lX oldUnit=%08lX liveType=%04X", entry, stale->unit, (unsigned int)(*((WORD*)sourceRecord)));
+                FlushTrace();
+                InvalidateEntryLink(entry);
+            }
+            return;
+        }
         ENTRY_UNIT_LINK* link = RecordEntryUnit(entry, unit);
         if (link == NULL) return;
         link->sourceEntry = entry;
@@ -499,6 +524,20 @@ namespace banner_256
         ENTRY_UNIT_LINK* source = FindEntryLink(sourceEntry);
         const DWORD unit = (source != NULL) ? source->unit : 0;
         if (unit == 0 || bodyEntry == 0 || sourceEntry == 0) return;
+
+        const WORD commitType = (WORD)source->sourceTypeAtCommit;
+        const WORD propType = *((WORD*)sourceEntry);
+        if (commitType != propType)
+        {
+            darkomen::detour::trace(
+                "Stage11 staleSourceReject unit=%08lX sourceRecord=%08lX sourceEntry=%08lX commitType=%04X propType=%04X bodyEntry=%08lX",
+                unit, source->sourceRecordAtCommit, sourceEntry, (unsigned int)commitType,
+                (unsigned int)propType, bodyEntry);
+            FlushTrace();
+            InvalidateEntryLink(bodyEntry);
+            return;
+        }
+
         ENTRY_UNIT_LINK* body = RecordEntryUnit(bodyEntry, unit);
         if (body == NULL) return;
         body->sourceEntry = sourceEntry;
@@ -514,7 +553,7 @@ namespace banner_256
         body->frameAtProp = *((DWORD*)(bodyEntry + 0x04));
         body->sourceRecordAtCommit = source->sourceRecordAtCommit;
         body->sourceTypeAtCommit = source->sourceTypeAtCommit;
-        body->sourceTypeAtProp = (DWORD)(*((WORD*)sourceEntry));
+        body->sourceTypeAtProp = (DWORD)propType;
     }
 
     static void ResetUnitStateForOwnerReuse(UNIT_STATE* state, DWORD newOwner)
@@ -802,7 +841,7 @@ namespace banner_256
         WriteJump(HOOK_QUEUE_COMMIT, (DWORD)(g_caves + 0x240), 7);
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
         g_loaded = TRUE;
-        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + source-flow ESI diagnostic");
+        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + stale queue-slot rejection");
         FlushTrace();
     }
 
