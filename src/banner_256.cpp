@@ -30,10 +30,10 @@
 // Managed owners remain resident until a genuinely different K>0 owner replaces
 // them or the UNIT_STATE itself is LRU-recycled; no time-based expiry is used.
 //
-// Targeted association diagnostics retain the exact ARM -> COMMIT -> PROPAGATE ->
-// CAPTURE provenance for each entry mapping. ARM records both the EBP parent unit
-// and the current member record's +0x40 owner reference (ownerRef-0x86 trueUnit),
-// but diagnostic data does not change which unit receives Stage11 correction.
+// Targeted diagnostics now snapshot bodyEntry+0/+4 at PROP time and compare that
+// snapshot against the same address at CAPTURE time. This directly tests whether
+// pooled body records are overwritten/reused between Hook C and Hook D. The prior
+// ARM firehose is retained as provenance data internally but is no longer logged.
 #include "header.h"
 #include "detour.h"
 #include <string.h>
@@ -131,6 +131,8 @@ namespace banner_256
         DWORD armMember;
         DWORD armOwnerRef;
         DWORD armTrueUnit;
+        DWORD ownerAtProp;
+        DWORD frameAtProp;
     };
 
     struct OWNER_K_CACHE
@@ -445,17 +447,6 @@ namespace banner_256
         g_pendingArmMember = memberRecord;
         g_pendingArmOwnerRef = ownerRef;
         g_pendingArmTrueUnit = trueUnit;
-
-        if ((g_firstManagedUnit != 0 &&
-             (IsNearManagedUnit(parentUnit) || IsNearManagedUnit(trueUnit))) ||
-            (trueUnit != 0 && trueUnit != parentUnit))
-        {
-            darkomen::detour::trace(
-                "Stage11 assoc ARM seq=%lu parentUnit=%08lX parentStride=%ld member=%08lX ownerRef=%08lX trueUnit=%08lX trueStride=%ld",
-                (DWORD)g_pendingArmSequence, parentUnit, UnitStrideDelta(parentUnit),
-                memberRecord, ownerRef, trueUnit, UnitStrideDelta(trueUnit));
-            FlushTrace();
-        }
     }
 
     static void __cdecl CommitBodyEntry(DWORD entry)
@@ -478,15 +469,8 @@ namespace banner_256
         link->armMember = armMember;
         link->armOwnerRef = armOwnerRef;
         link->armTrueUnit = armTrueUnit;
-        if (IsNearManagedUnit(unit) || IsNearManagedUnit(armTrueUnit))
-        {
-            darkomen::detour::trace(
-                "Stage11 assoc COMMIT seq=%lu entry=%08lX unit=%08lX stride=%ld armSeq=%lu member=%08lX trueUnit=%08lX trueStride=%ld",
-                link->commitSequence, entry, unit, UnitStrideDelta(unit),
-                link->armSequence, link->armMember, link->armTrueUnit,
-                UnitStrideDelta(link->armTrueUnit));
-            FlushTrace();
-        }
+        link->ownerAtProp = 0;
+        link->frameAtProp = 0;
     }
 
     static void __cdecl ClearPendingBodyUnit() { ClearPendingArm(); }
@@ -519,16 +503,8 @@ namespace banner_256
         body->armMember = source->armMember;
         body->armOwnerRef = source->armOwnerRef;
         body->armTrueUnit = source->armTrueUnit;
-        if (IsNearManagedUnit(unit) || IsNearManagedUnit(body->armTrueUnit))
-        {
-            darkomen::detour::trace(
-                "Stage11 assoc PROP seq=%lu source=%08lX mappedUnit=%08lX stride=%ld body=%08lX commitSeq=%lu commitUnit=%08lX armSeq=%lu parent=%08lX member=%08lX trueUnit=%08lX trueStride=%ld",
-                body->propagateSequence, sourceEntry, unit, UnitStrideDelta(unit),
-                bodyEntry, body->commitSequence, body->commitUnit,
-                body->armSequence, body->armParentUnit, body->armMember,
-                body->armTrueUnit, UnitStrideDelta(body->armTrueUnit));
-            FlushTrace();
-        }
+        body->ownerAtProp = *((DWORD*)bodyEntry);
+        body->frameAtProp = *((DWORD*)(bodyEntry + 0x04));
     }
 
     static void ResetUnitStateForOwnerReuse(UNIT_STATE* state, DWORD newOwner)
@@ -567,22 +543,20 @@ namespace banner_256
         if (ownerCache->cachedK <= 0.0f) return;
 
         if (g_firstManagedUnit == 0) g_firstManagedUnit = unit;
-        const DWORD captureSequence = NextAssocSequence();
-        darkomen::detour::trace(
-            "Stage11 assoc CAPTURE seq=%lu body=%08lX mappedUnit=%08lX stride=%ld owner=%08lX source=%08lX commitSeq=%lu commitUnit=%08lX propSeq=%lu armSeq=%lu parent=%08lX parentStride=%ld member=%08lX ownerRef=%08lX trueUnit=%08lX trueStride=%ld",
-            captureSequence, entry, unit, UnitStrideDelta(unit), owner,
-            (bodyLink != NULL) ? bodyLink->sourceEntry : 0,
-            (bodyLink != NULL) ? bodyLink->commitSequence : 0,
-            (bodyLink != NULL) ? bodyLink->commitUnit : 0,
-            (bodyLink != NULL) ? bodyLink->propagateSequence : 0,
-            (bodyLink != NULL) ? bodyLink->armSequence : 0,
-            (bodyLink != NULL) ? bodyLink->armParentUnit : 0,
-            (bodyLink != NULL) ? UnitStrideDelta(bodyLink->armParentUnit) : 0x7FFFFFFF,
-            (bodyLink != NULL) ? bodyLink->armMember : 0,
-            (bodyLink != NULL) ? bodyLink->armOwnerRef : 0,
-            (bodyLink != NULL) ? bodyLink->armTrueUnit : 0,
-            (bodyLink != NULL) ? UnitStrideDelta(bodyLink->armTrueUnit) : 0x7FFFFFFF);
-        FlushTrace();
+        const LONG stride = UnitStrideDelta(unit);
+        if (stride != 0 && stride != 0x7FFFFFFF && stride >= -8 && stride <= 8)
+        {
+            const DWORD ownerAtProp = (bodyLink != NULL) ? bodyLink->ownerAtProp : 0;
+            const DWORD frameAtProp = (bodyLink != NULL) ? bodyLink->frameAtProp : 0;
+            darkomen::detour::trace(
+                "Stage11 bodyRecordCompare body=%08lX unit=%08lX stride=%ld ownerAtProp=%08lX frameAtProp=%08lX ownerAtCapture=%08lX frameAtCapture=%08lX ownerChanged=%d frameChanged=%d source=%08lX commitSeq=%lu propSeq=%lu",
+                entry, unit, stride, ownerAtProp, frameAtProp, owner, (DWORD)frameIndex,
+                ownerAtProp != owner, frameAtProp != (DWORD)frameIndex,
+                (bodyLink != NULL) ? bodyLink->sourceEntry : 0,
+                (bodyLink != NULL) ? bodyLink->commitSequence : 0,
+                (bodyLink != NULL) ? bodyLink->propagateSequence : 0);
+            FlushTrace();
+        }
 
         if (state->spriteOwner != 0 && state->spriteOwner != owner)
             ResetUnitStateForOwnerReuse(state, owner);
@@ -816,7 +790,7 @@ namespace banner_256
         WriteJump(HOOK_QUEUE_COMMIT, (DWORD)(g_caves + 0x240), 7);
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
         g_loaded = TRUE;
-        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + ARM member-owner back-pointer diagnostics");
+        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + PROP/CAPTURE body-record comparison");
         FlushTrace();
     }
 
