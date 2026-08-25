@@ -15,7 +15,7 @@ namespace detour {
 
 	// Stage11 diagnostics can be disabled again after the current melee/banner
 	// validation is complete.
-	static const bool stage11TraceEnabled = true;
+	static const bool stage11TraceEnabled = false;
 
 	void hookFunc(void* hookFunc, int addr)
 	{
