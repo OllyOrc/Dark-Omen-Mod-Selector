@@ -19,7 +19,7 @@
 // A newly discovered non-zero K forces bounds refresh once per genuinely new
 // (owner,K,scale) signature. Enlarged sprites use one proportional banner-gap
 // rule derived from the validated native-147 reference: effective K per top
-// pixel is 3.6503. A further fixed +10px raise is applied only to those Stage11
+// pixel is 3.6503. A further fixed +20px raise is applied only to those Stage11
 // enlarged sprites, leaving zero-K vanilla owners completely untouched.
 #include "header.h"
 #include "detour.h"
@@ -93,7 +93,7 @@ namespace banner_256
     // Applying the same effective-K-per-top ratio keeps the banner gap
     // proportional to apparent sprite height at every zoom/depth.
     static const float PROPORTIONAL_EFFECTIVE_K_PER_TOP = 3.6503f;
-    static const int STAGE11_BANNER_EXTRA_RAISE_PX = 10;
+    static const int STAGE11_BANNER_EXTRA_RAISE_PX = 20;
 
     struct UNIT_STATE
     {
@@ -881,7 +881,7 @@ namespace banner_256
 
         g_loaded = TRUE;
         darkomen::detour::trace(
-            "Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 10px enlarged-sprite lift + refresh-signature suppression active");
+            "Stage11 installed: trusted source-to-body association + owner-only native K + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression active");
         FlushTrace();
     }
 
