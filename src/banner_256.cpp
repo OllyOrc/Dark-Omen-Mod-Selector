@@ -7,7 +7,7 @@
 // owner+0x08 is the frame count and owner+0x10 is the 0x2c-stride frame table.
 // We scan each owner once, read native frame width/height directly from +0x24
 // and +0x28, derive sprite-wide maximum native dimensions and a top proxy, and
-// admit only owners whose native width or height exceeds 128. The existing
+// admit owners whose native width or height reaches 128. The existing
 // 650/1100/1800 K curve remains driven entirely by maxTop and is cached by owner.
 //
 // Body-entry ownership is captured before pushIconDrawRecord loses provenance:
@@ -338,7 +338,7 @@ namespace banner_256
             if (topExtent > maxTop) maxTop = topExtent;
         }
         float k = 0.0f;
-        if (maxWidth > 128 || maxHeight > 128) k = ContinuousAnchorK(maxTop);
+        if (maxWidth >= 128 || maxHeight >= 128) k = ContinuousAnchorK(maxTop);
         float raiseScale = 1.0f;
         if (k > 0.0f && maxTop > 0.0f) raiseScale = (maxTop * PROPORTIONAL_EFFECTIVE_K_PER_TOP) / k;
         cache->frameBase = frameBase;
@@ -840,7 +840,7 @@ namespace banner_256
         WriteJump(HOOK_QUEUE_COMMIT, (DWORD)(g_caves + 0x240), 7);
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
         g_loaded = TRUE;
-        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + native >128 eligibility + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + stale queue-slot rejection");
+        darkomen::detour::trace("Stage11 installed: trusted source-to-body association + owner-only native K + native >=128 eligibility + proportional 3.6503 effective-K/top spacing + 20px enlarged-sprite lift + refresh-signature suppression + lifecycle LRU recycling + managed-owner churn suppression + no managed-owner timeout + stale queue-slot rejection");
         FlushTrace();
     }
 
